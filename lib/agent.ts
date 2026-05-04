@@ -1,6 +1,7 @@
 // lib/ai-agent.ts
 import Groq from "groq-sdk";
 import { restaurantInfo, getMenuText } from "./menu-data";
+import { getAIResponse } from "@/lib/agent";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 

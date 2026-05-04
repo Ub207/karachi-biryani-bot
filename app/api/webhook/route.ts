@@ -1,7 +1,8 @@
 // app/api/webhook/route.ts
+import { sendWhatsAppMessage, markAsRead } from "@/lib/whatsapp";  // ✅ matches lib/whatsapp.ts
+import { getAIResponse } from "@/lib/agent";                       // ✅ matches lib/agent.ts
 import { NextRequest, NextResponse } from "next/server";
-import { sendWhatsAppMessage, markAsRead } from "@/lib/whatsapp";
-import { getAIResponse } from "@/lib/ai-agent";
+
 
 // GET: Webhook verification (Meta calls this once)
 export async function GET(request: NextRequest) {
