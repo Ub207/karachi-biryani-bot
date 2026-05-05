@@ -2,20 +2,18 @@
 import Groq from "groq-sdk";
 import { flatMenu, restaurantInfo, getMenuText } from "./menu-data";
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Lazy initialization to avoid build-time errors
+function getGroqClient() {
+  return new Groq({ apiKey: process.env.GROQ_API_KEY });
+}
 
-// Type definitions
 type ConversationMessage = {
   role: "user" | "assistant";
   content: string;
 };
 
-// In-memory conversation store
 const conversations = new Map<string, ConversationMessage[]>();
 
-// =================================================================
-// INTENT CLASSIFIER
-// =================================================================
 const INTENT_PROMPT = `You are an intent classifier for a Pakistani restaurant WhatsApp bot.
 
 OUR MENU ITEMS:
@@ -26,19 +24,15 @@ Return ONLY valid JSON. No explanation. No markdown.
 INTENTS:
 - GREETING: salam, hi, hello, assalam, salaam, asalamualaikum, etc.
 - MENU: user asks for menu, list, what do you have, kya hai, items, etc.
-- ORDER: user wants to order specific items (mention quantities or item names)
+- ORDER: user wants to order specific items
 - PRICE_QUERY: user asks price of specific item
 - ITEM_CHECK: user asks "do you have X?" (pizza, dahi, etc.)
 - CONFIRM: yes, haan, confirm, ok, theek hai
 - CANCEL: no, nahi, cancel, mat karo
 - ADDRESS: user provides delivery address
-- COMPLAINT: discount request, price negotiation, complaint
+- COMPLAINT: discount request, price negotiation
 - THANKS: thank you, shukria, thanks
 - UNKNOWN: anything else
-
-EXTRACT:
-- For ORDER/PRICE_QUERY: extract item names from user message
-- Match user's words against OUR MENU above (fuzzy matching OK)
 
 EXAMPLES:
 
@@ -51,9 +45,6 @@ User: "Assalamu alaikum"
 User: "menu"
 {"intent": "MENU", "items": []}
 
-User: "kya hai apke pas?"
-{"intent": "MENU", "items": []}
-
 User: "sindhi biryani"
 {"intent": "PRICE_QUERY", "items": [{"name": "Sindhi Biryani Single", "qty": 1}]}
 
@@ -62,9 +53,6 @@ User: "1 chicken biryani family pack"
 
 User: "pizza?"
 {"intent": "ITEM_CHECK", "items": [{"name": "pizza", "qty": 1}]}
-
-User: "dahi?"
-{"intent": "ITEM_CHECK", "items": [{"name": "dahi", "qty": 1}]}
 
 User: "discount do"
 {"intent": "COMPLAINT", "items": []}
@@ -100,6 +88,7 @@ async function classifyIntent(message: string, history: ConversationMessage[]) {
     : `User message: ${message}`;
 
   try {
+    const groq = getGroqClient();
     const res = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       temperature: 0.1,
@@ -112,14 +101,11 @@ async function classifyIntent(message: string, history: ConversationMessage[]) {
 
     return extractJSON(res.choices[0]?.message?.content || "{}");
   } catch (err) {
-    console.error("Intent classification error:", err);
+    console.error("Intent error:", err);
     return { intent: "UNKNOWN", items: [] };
   }
 }
 
-// =================================================================
-// MENU MATCHING
-// =================================================================
 function findMenuItem(searchName: string): string | null {
   if (!searchName) return null;
   const search = searchName.toLowerCase().trim();
@@ -150,9 +136,6 @@ function findAllMatches(searchName: string): string[] {
   );
 }
 
-// =================================================================
-// PRICING ENGINE
-// =================================================================
 type OrderItem = { name: string; qty: number };
 type MatchedItem = { name: string; qty: number; price: number; lineTotal: number };
 
@@ -177,9 +160,6 @@ function calculateOrder(items: OrderItem[]) {
   return { subtotal, matched };
 }
 
-// =================================================================
-// RESPONSE FORMATTERS
-// =================================================================
 function formatOrderConfirmation(matched: MatchedItem[], subtotal: number) {
   const list = matched
     .map(i => `• ${i.name} x${i.qty} = Rs. ${i.lineTotal}`)
@@ -212,9 +192,6 @@ function formatPriceInfo(matched: { name: string; price: number }[]) {
     `\n\nOrder karna ho to "1 ${matched[0].name}" likhein.`;
 }
 
-// =================================================================
-// MAIN AGENT FUNCTION
-// =================================================================
 export async function getAIResponse(
   userPhone: string,
   userMessage: string
@@ -230,7 +207,7 @@ export async function getAIResponse(
 
   try {
     const intent = await classifyIntent(userMessage, history);
-    console.log("Detected intent:", intent);
+    console.log("Intent:", intent);
 
     switch (intent.intent) {
       case "GREETING":
@@ -245,10 +222,10 @@ export async function getAIResponse(
 
       case "MENU":
         response = getMenuText() + 
-          `\n\n💬 Order karne ke liye item name likhein.\nMisal: "1 chicken biryani family pack"`;
+          `\n\n💬 Order karne ke liye item name likhein.`;
         break;
 
-      case "ITEM_CHECK":
+      case "ITEM_CHECK": {
         const checkItems = intent.items || [];
         if (checkItems.length === 0) {
           response = "Kaunsa item check karna hai? Item ka naam likhein.";
@@ -270,11 +247,12 @@ export async function getAIResponse(
             getMenuText();
         }
         break;
+      }
 
-      case "PRICE_QUERY":
+      case "PRICE_QUERY": {
         const priceItems = intent.items || [];
         if (priceItems.length === 0) {
-          response = "Kaunsa item ka rate puchna hai? Item ka naam likhein.";
+          response = "Kaunsa item ka rate puchna hai?";
           break;
         }
         
@@ -296,13 +274,12 @@ export async function getAIResponse(
             response += `\n\n❌ Yeh items available nahi: ${priceNotFound.join(", ")}`;
           }
         } else {
-          response = 
-            `❌ Maaf kijiye, yeh items available nahi.\n\n` +
-            getMenuText();
+          response = `❌ Yeh items available nahi.\n\n` + getMenuText();
         }
         break;
+      }
 
-      case "ORDER":
+      case "ORDER": {
         const orderItems = intent.items || [];
         if (orderItems.length === 0) {
           response = "Kya order karna hai? Item ka naam aur quantity likhein.";
@@ -336,11 +313,11 @@ export async function getAIResponse(
             const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
             response = 
               `❌ Maaf kijiye, *${itemName}* available nahi hai.\n\n` +
-              `Hamare paas yeh items hain:\n\n` +
               getMenuText();
           }
         }
         break;
+      }
 
       case "CONFIRM":
         response = 
@@ -352,15 +329,13 @@ export async function getAIResponse(
         break;
 
       case "CANCEL":
-        response = 
-          `Order cancel ho gaya. ❌\n\n` +
-          `Aur kuch help chahiye? "menu" likhein.`;
+        response = `Order cancel ho gaya. ❌\n\nAur kuch help chahiye? "menu" likhein.`;
         break;
 
       case "ADDRESS":
         response = 
           `✅ *Address note ho gaya!*\n\n` +
-          `📞 Hamara staff aap ko ${restaurantInfo.phone} se confirmation call karega.\n` +
+          `📞 Confirmation call: ${restaurantInfo.phone}\n` +
           `🛵 Delivery time: ${restaurantInfo.deliveryTime}\n\n` +
           `Shukriya! 🙏`;
         break;
@@ -369,7 +344,6 @@ export async function getAIResponse(
         response = 
           `Maaf kijiye, hamare prices fixed hain.\n` +
           `Discount available nahi hai.\n\n` +
-          `Quality aur taste ki guarantee hai!\n` +
           `Order karne ke liye menu dekhein:\n\n` +
           getMenuText();
         break;
@@ -377,18 +351,16 @@ export async function getAIResponse(
       case "THANKS":
         response = 
           `Aap ka shukriya! 🙏\n` +
-          `${restaurantInfo.name} ko visit karne ke liye!\n\n` +
-          `Phir aana, hum hamesha taiyaar hain! 😊`;
+          `${restaurantInfo.name} ko visit karne ke liye!`;
         break;
 
       default:
         response = 
           `Maaf kijiye, samajh nahi saka. 🤔\n\n` +
-          `Main aap ki yeh madad kar sakta hoon:\n\n` +
+          `Yeh karein:\n\n` +
           `📋 "menu" - menu dekhne ke liye\n` +
-          `🛒 Item name + qty - order karne ke liye\n` +
-          `💬 Sirf item name - rate puchne ke liye\n\n` +
-          `Misal: "1 chicken biryani" ya "menu"`;
+          `🛒 "1 chicken biryani" - order ke liye\n` +
+          `💬 Item ka naam - rate ke liye`;
     }
 
     history.push({ role: "assistant", content: response });
@@ -397,6 +369,6 @@ export async function getAIResponse(
 
   } catch (error) {
     console.error("Agent error:", error);
-    return "⚠️ Maaf kijiye, technical issue hai. Thori dair baad try karein.";
+    return "⚠️ Technical issue hai. Thori dair baad try karein.";
   }
 }
