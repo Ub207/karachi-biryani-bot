@@ -8,13 +8,27 @@ const conversations = new Map<
   { role: string; content: string }[]
 >();
 
+/**
+ * 🔥 MENU TEXT (AI ko actual menu pata hoga ab)
+ */
+const menuText = Object.entries(menu)
+  .map(([name, price]) => `${name} - Rs ${price}`)
+  .join("\n");
+
+/**
+ * 🧠 SYSTEM PROMPT
+ */
 const SYSTEM_PROMPT = `
 You are a STRICT order-taking assistant for ${restaurantInfo.name}.
 
+MENU:
+${menuText}
+
 RULES:
+- Only take orders from this menu
 - No discounts
 - No fake items
-- Only use provided menu
+- If item not in menu → say "Item available nahi hai"
 - Be short and polite
 `;
 
@@ -42,21 +56,26 @@ export async function getAIResponse(
       max_tokens: 250,
     });
 
-    const reply =
+    let reply =
       completion.choices[0]?.message?.content ||
       "Maaf kijiye, error ho gaya.";
+
+    // 🔒 Basic safety fallback
+    if (reply.length > 500) {
+      reply = "Please apna order short aur clear likhein.";
+    }
 
     history.push({ role: "assistant", content: reply });
     conversations.set(userPhone, history);
 
     return reply;
   } catch (err) {
-    return "Technical issue hai, please try again.";
+    return "Technical issue hai, please dobara try karein.";
   }
 }
 
 /**
- * 💰 FIXED PRICING (ONLY IMPORTANT CHANGE)
+ * 💰 PRICING FUNCTION (TS SAFE)
  */
 export function calculateTotal(
   items: { name: string; qty?: number }[]
@@ -66,7 +85,6 @@ export function calculateTotal(
   for (const item of items) {
     const key = item.name;
 
-    // ✅ FINAL FIX (NO TYPESCRIPT ERROR)
     const price = (menu as Record<string, number>)[key];
 
     if (price === undefined) {
