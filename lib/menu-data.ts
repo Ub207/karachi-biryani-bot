@@ -10,86 +10,24 @@ export const restaurantInfo = {
 };
 
 /**
- * 📦 STRUCTURED MENU (for UI + display)
+ * ⚡ FLAT MENU (USED FOR PRICING ENGINE)
  */
-export const menu = [
-  {
-    category: "Biryani (Specialty)",
-    items: [
-      { id: "B1", name: "Chicken Biryani Single", price: 350 },
-      { id: "B2", name: "Chicken Biryani Family Pack", price: 1200 },
-      { id: "B3", name: "Beef Biryani Single", price: 400 },
-      { id: "B4", name: "Mutton Biryani Single", price: 550 },
-      { id: "B5", name: "Sindhi Biryani Single", price: 380 },
-    ],
-  },
-  {
-    category: "BBQ & Karahi",
-    items: [
-      { id: "K1", name: "Chicken Karahi Half", price: 1100 },
-      { id: "K2", name: "Chicken Karahi Full", price: 2000 },
-      { id: "K3", name: "Mutton Karahi Half", price: 1800 },
-      { id: "K4", name: "Seekh Kebab (6 pcs)", price: 600 },
-      { id: "K5", name: "Chicken Tikka (4 pcs)", price: 700 },
-    ],
-  },
-  {
-    category: "Sides & Drinks",
-    items: [
-      { id: "S1", name: "Naan", price: 60 },
-      { id: "S2", name: "Garlic Naan", price: 100 },
-      { id: "S3", name: "Raita", price: 80 },
-      { id: "D1", name: "Coke 1.5L", price: 250 },
-      { id: "D2", name: "Lassi", price: 150 },
-    ],
-  },
-];
+export const menu: Record<string, number> = {
+  "Chicken Biryani Single": 350,
+  "Chicken Biryani Family Pack": 1200,
+  "Beef Biryani Single": 400,
+  "Mutton Biryani Single": 550,
+  "Sindhi Biryani Single": 380,
 
-/**
- * ⚡ FLAT MAP (CRITICAL FOR BACKEND LOGIC)
- * This is what pricing engine MUST use
- */
-export const menuMap: Record<
-  string,
-  { id: string; name: string; price: number }
-> = {
-  B1: { id: "B1", name: "Chicken Biryani Single", price: 350 },
-  B2: { id: "B2", name: "Chicken Biryani Family Pack", price: 1200 },
-  B3: { id: "B3", name: "Beef Biryani Single", price: 400 },
-  B4: { id: "B4", name: "Mutton Biryani Single", price: 550 },
-  B5: { id: "B5", name: "Sindhi Biryani Single", price: 380 },
+  "Chicken Karahi Half": 1100,
+  "Chicken Karahi Full": 2000,
+  "Mutton Karahi Half": 1800,
+  "Seekh Kebab": 600,
+  "Chicken Tikka": 700,
 
-  K1: { id: "K1", name: "Chicken Karahi Half", price: 1100 },
-  K2: { id: "K2", name: "Chicken Karahi Full", price: 2000 },
-  K3: { id: "K3", name: "Mutton Karahi Half", price: 1800 },
-  K4: { id: "K4", name: "Seekh Kebab (6 pcs)", price: 600 },
-  K5: { id: "K5", name: "Chicken Tikka (4 pcs)", price: 700 },
-
-  S1: { id: "S1", name: "Naan", price: 60 },
-  S2: { id: "S2", name: "Garlic Naan", price: 100 },
-  S3: { id: "S3", name: "Raita", price: 80 },
-  D1: { id: "D1", name: "Coke 1.5L", price: 250 },
-  D2: { id: "D2", name: "Lassi", price: 150 },
+  "Naan": 60,
+  "Garlic Naan": 100,
+  "Raita": 80,
+  "Coke 1.5L": 250,
+  "Lassi": 150,
 };
-
-/**
- * 🧾 SAFE MENU TEXT (ONLY FOR DISPLAY / WHATSAPP VIEW)
- */
-export function getMenuText(): string {
-  let text = `*${restaurantInfo.name} Menu*\n\n`;
-
-  menu.forEach((cat) => {
-    text += `*${cat.category}*\n`;
-
-    cat.items.forEach((item) => {
-      text += `${item.id}. ${item.name} - Rs. ${item.price}\n`;
-    });
-
-    text += "\n";
-  });
-
-  text += `_Minimum order: Rs. ${restaurantInfo.minimumOrder}_\n`;
-  text += `_Delivery fee: Rs. ${restaurantInfo.deliveryFee}_`;
-
-  return text;
-}
