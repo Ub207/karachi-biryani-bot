@@ -1,42 +1,114 @@
-// lib/agent.ts
 import Groq from "groq-sdk";
-import { restaurantInfo, getMenuText } from "./menu-data";
+import { menu } from "./menu-data";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const conversations = new Map<string, { role: string; content: string }[]>();
+/**
+ * ⚠️ In production replace Map with Redis
+ */
+const conversations = new Map<
+  string,
+  { role: "user" | "assistant"; content: string }[]
+>();
 
-const SYSTEM_PROMPT = `You are a friendly customer service agent for ${restaurantInfo.name}, a popular biryani restaurant in Karachi, Pakistan.
+/**
+ * 🔥 INTENT CLASSIFIER ONLY (NO ANSWERS)
+ */
+const INTENT_PROMPT = `
+You are an intent classifier for a restaurant WhatsApp bot.
 
-RESTAURANT INFO:
-- Address: ${restaurantInfo.address}
-- Hours: ${restaurantInfo.hours}
-- Phone: ${restaurantInfo.phone}
-- Delivery Areas: ${restaurantInfo.deliveryAreas.join(", ")}
-- Minimum Order: Rs. ${restaurantInfo.minimumOrder}
-- Delivery Fee: Rs. ${restaurantInfo.deliveryFee}
-- Delivery Time: ${restaurantInfo.deliveryTime}
+Return ONLY valid JSON.
 
-MENU:
-${getMenuText()}
-
-YOUR JOB:
-1. Greet customers warmly in Roman Urdu/English mix
-2. Help them choose from menu
-3. Take orders (item, quantity, address, phone)
-4. Answer questions about hours, location, delivery
-5. Calculate total bill
+INTENTS:
+- ORDER
+- MENU
+- PRICE_QUERY
+- GREETING
+- UNKNOWN
 
 RULES:
-- Reply in same language customer uses (Urdu/Roman Urdu/English)
-- Keep messages SHORT (under 100 words)
-- Be warm and friendly
-- If order below Rs. ${restaurantInfo.minimumOrder}, politely inform
-- Use emojis sparingly (max 1-2 per message)
-- Always confirm order before finalizing`;
+- Do NOT respond to user
+- Do NOT explain anything
+- Output ONLY JSON
+- Extract food items exactly as written if present
 
-export async function getAIResponse(userPhone: string, userMessage: string): Promise<string> {
+FORMAT:
+{
+  "intent": "ORDER",
+  "items": [
+    { "name": "chicken biryani", "qty": 1 }
+  ]
+}
+`;
+
+/**
+ * 🧠 1. INTENT CLASSIFIER (LLM SAFE USE)
+ */
+async function classifyIntent(message: string) {
+  const res = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    temperature: 0.1,
+    max_tokens: 200,
+    messages: [
+      { role: "system", content: INTENT_PROMPT },
+      { role: "user", content: message },
+    ],
+  });
+
+  try {
+    return JSON.parse(res.choices[0]?.message?.content || "{}");
+  } catch {
+    return { intent: "UNKNOWN", items: [] };
+  }
+}
+
+/**
+ * 💰 PRICE ENGINE (NO AI ALLOWED)
+ */
+function calculateTotal(items: { name: string; qty: number }[]) {
+  let total = 0;
+
+  for (const item of items) {
+    const key = Object.keys(menu).find(
+      (k) => k.toLowerCase() === item.name.toLowerCase()
+    );
+
+    if (!key) {
+      throw new Error("ITEM_NOT_FOUND");
+    }
+
+    total += menu[key] * (item.qty || 1);
+  }
+
+  return total;
+}
+
+/**
+ * 🧾 RESPONSE TEMPLATES (NO LLM HERE)
+ */
+function formatOrder(items: any[], total: number) {
+  const list = items
+    .map((i) => `• ${i.name} x${i.qty}`)
+    .join("\n");
+
+  return `🧾 Aapka Order:\n${list}\n\n💰 Total: Rs. ${total}\n\nKya aap confirm karna chahte hain?`;
+}
+
+function getMenuText() {
+  return Object.entries(menu)
+    .map(([name, price]) => `• ${name} - Rs. ${price}`)
+    .join("\n");
+}
+
+/**
+ * 🧠 2. MAIN FUNCTION (SAFE ORCHESTRATION)
+ */
+export async function getAIResponse(
+  userPhone: string,
+  userMessage: string
+): Promise<string> {
   let history = conversations.get(userPhone) || [];
+
   history.push({ role: "user", content: userMessage });
 
   if (history.length > 10) {
@@ -44,27 +116,45 @@ export async function getAIResponse(userPhone: string, userMessage: string): Pro
   }
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history.map((msg) => ({
-          role: msg.role as "user" | "assistant",
-          content: msg.content,
-        })),
-      ],
-      temperature: 0.7,
-      max_tokens: 300,
-    });
+    const intent = await classifyIntent(userMessage);
 
-    const aiReply = completion.choices[0]?.message?.content || "Maaf kijiye, kuch problem hui.";
+    let response = "";
 
-    history.push({ role: "assistant", content: aiReply });
+    switch (intent.intent) {
+      case "GREETING":
+        response =
+          "Assalam o Alaikum! 😊 Aap kya order karna pasand karenge?\n\n" +
+          getMenuText();
+        break;
+
+      case "MENU":
+        response = `📋 Menu:\n\n${getMenuText()}`;
+        break;
+
+      case "PRICE_QUERY":
+      case "ORDER":
+        try {
+          const total = calculateTotal(intent.items || []);
+          response = formatOrder(intent.items || [], total);
+        } catch (err) {
+          response =
+            "❌ Yeh item available nahi hai. Yeh humara menu hai:\n\n" +
+            getMenuText();
+        }
+        break;
+
+      default:
+        response =
+          "Maaf kijiye, main samajh nahi saka. Aap menu dekhna chahte hain?";
+    }
+
+    history.push({ role: "assistant", content: response });
     conversations.set(userPhone, history);
 
-    return aiReply;
+    return response;
   } catch (error) {
-    console.error("Groq API error:", error);
-    return "Maaf kijiye, abhi technical issue hai. Phir try karein.";
+    console.error("Agent error:", error);
+
+    return "⚠️ Technical issue hai, please thori dair baad try karein.";
   }
 }
