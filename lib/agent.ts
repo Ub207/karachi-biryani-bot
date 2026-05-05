@@ -15,7 +15,7 @@ RULES:
 - No discounts
 - No fake items
 - Only use provided menu
-- Be concise and polite
+- Be short and polite
 `;
 
 export async function getAIResponse(
@@ -26,9 +26,7 @@ export async function getAIResponse(
 
   history.push({ role: "user", content: userMessage });
 
-  if (history.length > 20) {
-    history = history.slice(-20);
-  }
+  if (history.length > 20) history = history.slice(-20);
 
   try {
     const completion = await groq.chat.completions.create({
@@ -58,7 +56,7 @@ export async function getAIResponse(
 }
 
 /**
- * 💰 FIXED PRICING FUNCTION (BUILD ERROR FIX)
+ * 💰 FIXED PRICING (ONLY IMPORTANT CHANGE)
  */
 export function calculateTotal(
   items: { name: string; qty?: number }[]
@@ -68,10 +66,10 @@ export function calculateTotal(
   for (const item of items) {
     const key = item.name;
 
-    // ✅ FIX: TS safe access
-    const price = menu[key as keyof typeof menu];
+    // ✅ FINAL FIX (NO TYPESCRIPT ERROR)
+    const price = (menu as Record<string, number>)[key];
 
-    if (!price) {
+    if (price === undefined) {
       throw new Error(`Invalid menu item: ${key}`);
     }
 
