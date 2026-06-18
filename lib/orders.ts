@@ -1,5 +1,4 @@
 import { getRedis } from './redis';
-import config from '@/config.json';
 
 export type OrderItem = {
   name: string;
@@ -36,41 +35,44 @@ function todayKey(): string {
 }
 
 export async function savePendingOrder(
+  phoneNumberId: string,
   phone: string,
   items: OrderItem[],
   subtotal: number,
   total: number
 ): Promise<void> {
-  console.log(`[orders] savePendingOrder: phone=${phone} items=${items.length} total=${total}`);
+  console.log(`[orders] savePendingOrder: client=${phoneNumberId} phone=${phone} items=${items.length} total=${total}`);
   const redis = getRedis();
   const pending: PendingOrder = { items, subtotal, total };
   try {
-    const result = await redis.setex(`pending:${phone}`, 3600, pending);
+    const result = await redis.setex(`pending:${phoneNumberId}:${phone}`, 3600, pending);
     console.log(`[orders] savePendingOrder: setex result=${JSON.stringify(result)}`);
   } catch (err) {
-    console.error(`[orders] savePendingOrder FAILED for phone=${phone}:`, err);
+    console.error(`[orders] savePendingOrder FAILED client=${phoneNumberId} phone=${phone}:`, err);
     throw err;
   }
 }
 
 export async function confirmOrder(
+  phoneNumberId: string,
   phone: string,
-  address: string
+  address: string,
+  deliveryFee: number
 ): Promise<Order | null> {
-  console.log(`[orders] confirmOrder: phone=${phone}`);
+  console.log(`[orders] confirmOrder: client=${phoneNumberId} phone=${phone}`);
   const redis = getRedis();
 
   let pending: PendingOrder | null;
   try {
-    pending = await redis.get<PendingOrder>(`pending:${phone}`);
-    console.log(`[orders] confirmOrder: pending lookup result=${pending ? 'found' : 'null'}`);
+    pending = await redis.get<PendingOrder>(`pending:${phoneNumberId}:${phone}`);
+    console.log(`[orders] confirmOrder: pending=${pending ? 'found' : 'null'}`);
   } catch (err) {
-    console.error(`[orders] confirmOrder FAILED reading pending order for phone=${phone}:`, err);
+    console.error(`[orders] confirmOrder FAILED reading pending order client=${phoneNumberId} phone=${phone}:`, err);
     throw err;
   }
 
   if (!pending) {
-    console.warn(`[orders] confirmOrder: no pending order found for phone=${phone}`);
+    console.warn(`[orders] confirmOrder: no pending order for client=${phoneNumberId} phone=${phone}`);
     return null;
   }
 
@@ -79,7 +81,7 @@ export async function confirmOrder(
     phone,
     items: pending.items,
     subtotal: pending.subtotal,
-    deliveryFee: config.business.deliveryFee,
+    deliveryFee,
     total: pending.total,
     address,
     timestamp: new Date().toISOString(),
@@ -88,11 +90,11 @@ export async function confirmOrder(
   const key = todayKey();
   try {
     await Promise.all([
-      redis.set(`order:${order.id}`, order),
-      redis.rpush(`orders:${key}`, order.id),
-      redis.del(`pending:${phone}`),
+      redis.set(`order:${phoneNumberId}:${order.id}`, order),
+      redis.rpush(`orders:${phoneNumberId}:${key}`, order.id),
+      redis.del(`pending:${phoneNumberId}:${phone}`),
     ]);
-    console.log(`[orders] confirmOrder: saved order id=${order.id} key=orders:${key}`);
+    console.log(`[orders] confirmOrder: saved id=${order.id} list=orders:${phoneNumberId}:${key}`);
   } catch (err) {
     console.error(`[orders] confirmOrder FAILED saving order id=${order.id}:`, err);
     throw err;
@@ -101,14 +103,14 @@ export async function confirmOrder(
   return order;
 }
 
-export async function getTodaysOrders(): Promise<Order[]> {
+export async function getTodaysOrders(phoneNumberId: string): Promise<Order[]> {
   const redis = getRedis();
   const key = todayKey();
-  const ids = await redis.lrange<string>(`orders:${key}`, 0, -1);
+  const ids = await redis.lrange<string>(`orders:${phoneNumberId}:${key}`, 0, -1);
   if (!ids.length) return [];
 
   const orders = await Promise.all(
-    ids.map((id) => redis.get<Order>(`order:${id}`))
+    ids.map((id) => redis.get<Order>(`order:${phoneNumberId}:${id}`))
   );
 
   return orders.filter((o): o is Order => o !== null);

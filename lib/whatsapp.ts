@@ -1,21 +1,28 @@
 // lib/whatsapp.ts
 import axios from "axios";
 
-const WHATSAPP_API_URL = `https://graph.facebook.com/v21.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+function apiUrl(phoneNumberId: string) {
+  return `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
+}
 
-export async function sendWhatsAppMessage(to: string, message: string) {
+export async function sendWhatsAppMessage(
+  to: string,
+  message: string,
+  token: string,
+  phoneNumberId: string
+) {
   try {
     const response = await axios.post(
-      WHATSAPP_API_URL,
+      apiUrl(phoneNumberId),
       {
         messaging_product: "whatsapp",
-        to: to,
+        to,
         type: "text",
         text: { body: message },
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
       }
@@ -28,10 +35,14 @@ export async function sendWhatsAppMessage(to: string, message: string) {
   }
 }
 
-export async function markAsRead(messageId: string) {
+export async function markAsRead(
+  messageId: string,
+  token: string,
+  phoneNumberId: string
+) {
   try {
     await axios.post(
-      WHATSAPP_API_URL,
+      apiUrl(phoneNumberId),
       {
         messaging_product: "whatsapp",
         status: "read",
@@ -39,12 +50,12 @@ export async function markAsRead(messageId: string) {
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
       }
     );
-  } catch (error) {
+  } catch {
     // Silent fail - not critical
   }
 }

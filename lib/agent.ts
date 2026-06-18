@@ -1,9 +1,7 @@
-// lib/agent.ts
 import Groq from "groq-sdk";
-import { flatMenu, restaurantInfo, getMenuText } from "./menu-data";
+import { ClientConfig, buildFlatMenu, buildMenuText } from "./client-config";
 import { savePendingOrder, confirmOrder } from "./orders";
 
-// Lazy initialization to avoid build-time errors
 function getGroqClient() {
   return new Groq({ apiKey: process.env.GROQ_API_KEY });
 }
@@ -13,9 +11,11 @@ type ConversationMessage = {
   content: string;
 };
 
+// Keyed by `${phoneNumberId}:${userPhone}` to isolate per-client conversations
 const conversations = new Map<string, ConversationMessage[]>();
 
-const INTENT_PROMPT = `You are an intent classifier for a Pakistani restaurant WhatsApp bot.
+function buildIntentPrompt(flatMenu: Record<string, number>): string {
+  return `You are an intent classifier for a Pakistani restaurant WhatsApp bot.
 
 OUR MENU ITEMS:
 ${Object.keys(flatMenu).join(", ")}
@@ -63,28 +63,34 @@ User: "haan"
 
 User: "shukria"
 {"intent": "THANKS", "items": []}`;
+}
 
 function extractJSON(text: string): any {
   try {
     return JSON.parse(text);
   } catch {}
-  
+
   const match = text.match(/\{[\s\S]*\}/);
   if (match) {
     try {
       return JSON.parse(match[0]);
     } catch {}
   }
-  
+
   return { intent: "UNKNOWN", items: [] };
 }
 
-async function classifyIntent(message: string, history: ConversationMessage[]) {
-  const recentContext = history.slice(-4)
-    .map(h => `${h.role}: ${h.content}`)
+async function classifyIntent(
+  message: string,
+  history: ConversationMessage[],
+  flatMenu: Record<string, number>
+) {
+  const recentContext = history
+    .slice(-4)
+    .map((h) => `${h.role}: ${h.content}`)
     .join("\n");
-  
-  const userInput = recentContext 
+
+  const userInput = recentContext
     ? `Conversation:\n${recentContext}\n\nNew message: ${message}`
     : `User message: ${message}`;
 
@@ -95,7 +101,7 @@ async function classifyIntent(message: string, history: ConversationMessage[]) {
       temperature: 0.1,
       max_tokens: 200,
       messages: [
-        { role: "system", content: INTENT_PROMPT },
+        { role: "system", content: buildIntentPrompt(flatMenu) },
         { role: "user", content: userInput },
       ],
     });
@@ -107,97 +113,124 @@ async function classifyIntent(message: string, history: ConversationMessage[]) {
   }
 }
 
-function findMenuItem(searchName: string): string | null {
+function findMenuItem(
+  searchName: string,
+  flatMenu: Record<string, number>
+): string | null {
   if (!searchName) return null;
   const search = searchName.toLowerCase().trim();
-  
-  const exact = Object.keys(flatMenu).find(k => k.toLowerCase() === search);
+
+  const exact = Object.keys(flatMenu).find((k) => k.toLowerCase() === search);
   if (exact) return exact;
-  
+
   const contains = Object.keys(flatMenu).find(
-    k => k.toLowerCase().includes(search) || search.includes(k.toLowerCase())
+    (k) =>
+      k.toLowerCase().includes(search) || search.includes(k.toLowerCase())
   );
   if (contains) return contains;
-  
+
   const searchWords = search.split(/\s+/);
-  return Object.keys(flatMenu).find(k => {
-    const itemWords = k.toLowerCase().split(/\s+/);
-    return searchWords.some(sw => 
-      sw.length > 2 && itemWords.some(iw => iw.includes(sw) || sw.includes(iw))
-    );
-  }) || null;
+  return (
+    Object.keys(flatMenu).find((k) => {
+      const itemWords = k.toLowerCase().split(/\s+/);
+      return searchWords.some(
+        (sw) => sw.length > 2 && itemWords.some((iw) => iw.includes(sw) || sw.includes(iw))
+      );
+    }) || null
+  );
 }
 
-function findAllMatches(searchName: string): string[] {
+function findAllMatches(
+  searchName: string,
+  flatMenu: Record<string, number>
+): string[] {
   if (!searchName) return [];
   const search = searchName.toLowerCase().trim();
   return Object.keys(flatMenu).filter(
-    k => k.toLowerCase().includes(search) || 
-         search.split(/\s+/).some(w => w.length > 2 && k.toLowerCase().includes(w))
+    (k) =>
+      k.toLowerCase().includes(search) ||
+      search.split(/\s+/).some((w) => w.length > 2 && k.toLowerCase().includes(w))
   );
 }
 
 type OrderItem = { name: string; qty: number };
 type MatchedItem = { name: string; qty: number; price: number; lineTotal: number };
 
-function calculateOrder(items: OrderItem[]) {
+function calculateOrder(items: OrderItem[], flatMenu: Record<string, number>) {
   const matched: MatchedItem[] = [];
   let subtotal = 0;
-  
+
   for (const item of items) {
-    const key = findMenuItem(item.name);
+    const key = findMenuItem(item.name, flatMenu);
     if (!key) {
       throw new Error(`ITEM_NOT_FOUND:${item.name}`);
     }
-    
+
     const qty = item.qty || 1;
     const price = flatMenu[key];
     const lineTotal = price * qty;
-    
+
     matched.push({ name: key, qty, price, lineTotal });
     subtotal += lineTotal;
   }
-  
+
   return { subtotal, matched };
 }
 
-function formatOrderConfirmation(matched: MatchedItem[], subtotal: number) {
+function formatOrderConfirmation(
+  matched: MatchedItem[],
+  subtotal: number,
+  config: ClientConfig
+) {
+  const { currency, deliveryFee, minimumOrder } = config.business;
   const list = matched
-    .map(i => `• ${i.name} x${i.qty} = Rs. ${i.lineTotal}`)
+    .map((i) => `• ${i.name} x${i.qty} = ${currency} ${i.lineTotal}`)
     .join("\n");
 
-  const deliveryFee = restaurantInfo.deliveryFee;
-  const total = subtotal + deliveryFee;
-  const minOrder = restaurantInfo.minimumOrder;
-  
-  if (subtotal < minOrder) {
-    return `🧾 *Aap ka Order:*\n${list}\n\n` +
-      `Subtotal: Rs. ${subtotal}\n\n` +
-      `⚠️ Minimum order Rs. ${minOrder} hai.\n` +
-      `Rs. ${minOrder - subtotal} aur add karein.`;
+  if (subtotal < minimumOrder) {
+    return (
+      `🧾 *Aap ka Order:*\n${list}\n\n` +
+      `Subtotal: ${currency} ${subtotal}\n\n` +
+      `⚠️ Minimum order ${currency} ${minimumOrder} hai.\n` +
+      `${currency} ${minimumOrder - subtotal} aur add karein.`
+    );
   }
 
-  return `🧾 *Aap ka Order:*\n${list}\n\n` +
-    `Subtotal: Rs. ${subtotal}\n` +
-    `Delivery: Rs. ${deliveryFee}\n` +
+  const total = subtotal + deliveryFee;
+  return (
+    `🧾 *Aap ka Order:*\n${list}\n\n` +
+    `Subtotal: ${currency} ${subtotal}\n` +
+    `Delivery: ${currency} ${deliveryFee}\n` +
     `━━━━━━━━━━━━━\n` +
-    `*Total: Rs. ${total}*\n\n` +
+    `*Total: ${currency} ${total}*\n\n` +
     `Confirm karne ke liye "haan" likhein.\n` +
-    `Cancel karne ke liye "nahi" likhein.`;
+    `Cancel karne ke liye "nahi" likhein.`
+  );
 }
 
-function formatPriceInfo(matched: { name: string; price: number }[]) {
-  return matched
-    .map(i => `*${i.name}*: Rs. ${i.price}`)
-    .join("\n") +
-    `\n\nOrder karna ho to "1 ${matched[0].name}" likhein.`;
+function formatPriceInfo(
+  matched: { name: string; price: number }[],
+  currency: string
+) {
+  return (
+    matched.map((i) => `*${i.name}*: ${currency} ${i.price}`).join("\n") +
+    `\n\nOrder karna ho to "1 ${matched[0].name}" likhein.`
+  );
 }
 
 export async function getAIResponse(
+  phoneNumberId: string,
   userPhone: string,
-  userMessage: string
+  userMessage: string,
+  config: ClientConfig
 ): Promise<string> {
-  let history = conversations.get(userPhone) || [];
+  const flatMenu = buildFlatMenu(config);
+  const menuText = buildMenuText(config);
+  const { business } = config;
+  const currency = business.currency;
+  const convKey = `${phoneNumberId}:${userPhone}`;
+
+  let history = conversations.get(convKey) || [];
   history.push({ role: "user", content: userMessage });
 
   if (history.length > 20) {
@@ -207,23 +240,23 @@ export async function getAIResponse(
   let response = "";
 
   try {
-    const intent = await classifyIntent(userMessage, history);
+    const intent = await classifyIntent(userMessage, history, flatMenu);
     console.log("Intent:", intent);
 
     switch (intent.intent) {
       case "GREETING":
-        response = 
+        response =
+          config.responses?.greeting ??
           `*Wa alaikum assalam!* 🌙\n\n` +
-          `${restaurantInfo.name} mein khush amdeed!\n\n` +
-          `Main aap ki kaise help kar sakta hoon?\n\n` +
-          `📋 "menu" - menu dekhne ke liye\n` +
-          `🛒 "1 chicken biryani" - order karne ke liye\n` +
-          `💬 Item ka naam - rate puchne ke liye`;
+            `${business.name} mein khush amdeed!\n\n` +
+            `Main aap ki kaise help kar sakta hoon?\n\n` +
+            `📋 "menu" - menu dekhne ke liye\n` +
+            `🛒 "1 chicken biryani" - order karne ke liye\n` +
+            `💬 Item ka naam - rate puchne ke liye`;
         break;
 
       case "MENU":
-        response = getMenuText() + 
-          `\n\n💬 Order karne ke liye item name likhein.`;
+        response = menuText + `\n\n💬 Order karne ke liye item name likhein.`;
         break;
 
       case "ITEM_CHECK": {
@@ -232,20 +265,20 @@ export async function getAIResponse(
           response = "Kaunsa item check karna hai? Item ka naam likhein.";
           break;
         }
-        
+
         const askedItem = checkItems[0].name;
-        const found = findMenuItem(askedItem);
-        
+        const found = findMenuItem(askedItem, flatMenu);
+
         if (found) {
-          response = 
+          response =
             `✅ Haan! *${found}* available hai.\n` +
-            `Price: Rs. ${flatMenu[found]}\n\n` +
+            `Price: ${currency} ${flatMenu[found]}\n\n` +
             `Order karne ke liye "1 ${found}" likhein.`;
         } else {
-          response = 
+          response =
             `❌ Maaf kijiye, *${askedItem}* available nahi hai.\n\n` +
             `Hamare paas yeh items hain:\n\n` +
-            getMenuText();
+            menuText;
         }
         break;
       }
@@ -256,26 +289,26 @@ export async function getAIResponse(
           response = "Kaunsa item ka rate puchna hai?";
           break;
         }
-        
+
         const priceMatched: { name: string; price: number }[] = [];
         const priceNotFound: string[] = [];
-        
+
         for (const item of priceItems) {
-          const key = findMenuItem(item.name);
+          const key = findMenuItem(item.name, flatMenu);
           if (key) {
             priceMatched.push({ name: key, price: flatMenu[key] });
           } else {
             priceNotFound.push(item.name);
           }
         }
-        
+
         if (priceMatched.length > 0) {
-          response = formatPriceInfo(priceMatched);
+          response = formatPriceInfo(priceMatched, currency);
           if (priceNotFound.length > 0) {
             response += `\n\n❌ Yeh items available nahi: ${priceNotFound.join(", ")}`;
           }
         } else {
-          response = `❌ Yeh items available nahi.\n\n` + getMenuText();
+          response = `❌ Yeh items available nahi.\n\n` + menuText;
         }
         break;
       }
@@ -286,38 +319,40 @@ export async function getAIResponse(
           response = "Kya order karna hai? Item ka naam aur quantity likhein.";
           break;
         }
-        
+
         let ambiguous = false;
         for (const item of orderItems) {
-          const matches = findAllMatches(item.name);
+          const matches = findAllMatches(item.name, flatMenu);
           if (matches.length > 1) {
-            const exactMatch = matches.find(m => 
-              m.toLowerCase() === item.name.toLowerCase()
+            const exactMatch = matches.find(
+              (m) => m.toLowerCase() === item.name.toLowerCase()
             );
             if (!exactMatch) {
               ambiguous = true;
-              response = 
+              response =
                 `🤔 "${item.name}" mein kaunsa chahiye?\n\n` +
-                matches.map((m, i) => `${i + 1}. ${m} - Rs. ${flatMenu[m]}`).join("\n") +
+                matches
+                  .map((m, i) => `${i + 1}. ${m} - ${currency} ${flatMenu[m]}`)
+                  .join("\n") +
                 `\n\nFull naam likh kar bhejein.`;
               break;
             }
           }
         }
-        
+
         if (!ambiguous) {
           try {
-            const { subtotal, matched } = calculateOrder(orderItems);
-            const total = subtotal + restaurantInfo.deliveryFee;
-            await savePendingOrder(userPhone, matched, subtotal, total);
-            response = formatOrderConfirmation(matched, subtotal);
+            const { subtotal, matched } = calculateOrder(orderItems, flatMenu);
+            const total = subtotal + business.deliveryFee;
+            await savePendingOrder(phoneNumberId, userPhone, matched, subtotal, total);
+            response = formatOrderConfirmation(matched, subtotal, config);
           } catch (err: any) {
             const errorMsg = err.message || "";
             if (errorMsg.startsWith("ITEM_NOT_FOUND:")) {
               const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
               response =
                 `❌ Maaf kijiye, *${itemName}* available nahi hai.\n\n` +
-                getMenuText();
+                menuText;
             } else {
               console.error("Failed to save pending order:", err);
               response = `⚠️ System error: order save karne mein masla hua. Thori dair baad try karein.`;
@@ -328,11 +363,11 @@ export async function getAIResponse(
       }
 
       case "CONFIRM":
-        response = 
+        response =
           `✅ Shukriya!\n\n` +
           `Aap ka *delivery address* kya hai?\n\n` +
           `Hum yahan deliver karte hain:\n` +
-          `${restaurantInfo.deliveryAreas.map(a => `• ${a}`).join("\n")}\n\n` +
+          `${business.deliveryAreas.map((a) => `• ${a}`).join("\n")}\n\n` +
           `Apna pura address aur phone number bhejein.`;
         break;
 
@@ -343,7 +378,12 @@ export async function getAIResponse(
       case "ADDRESS": {
         let order = null;
         try {
-          order = await confirmOrder(userPhone, userMessage);
+          order = await confirmOrder(
+            phoneNumberId,
+            userPhone,
+            userMessage,
+            business.deliveryFee
+          );
         } catch (err) {
           console.error("Failed to confirm order:", err);
           response = `⚠️ System error: order confirm karne mein masla hua. Thori dair baad try karein.`;
@@ -351,35 +391,36 @@ export async function getAIResponse(
         }
         if (!order) {
           response =
+            config.responses?.noOrderFound ??
             `⚠️ Pending order nahi mila.\n\n` +
-            `Pehle apna order dein (e.g. "1 chicken biryani"), phir address bhejein.`;
+              `Pehle apna order dein (e.g. "1 chicken biryani"), phir address bhejein.`;
           break;
         }
         response =
           `✅ *Order confirm ho gaya!*\n\n` +
           `📦 *Order ID: ${order.id}*\n\n` +
-          `📞 Confirmation call: ${restaurantInfo.phone}\n` +
-          `🛵 Delivery time: ${restaurantInfo.deliveryTime}\n\n` +
+          `📞 Confirmation call: ${business.phone}\n` +
+          `🛵 Delivery time: ${business.deliveryTime}\n\n` +
           `Shukriya! 🙏`;
         break;
       }
 
       case "COMPLAINT":
-        response = 
+        response =
           `Maaf kijiye, hamare prices fixed hain.\n` +
           `Discount available nahi hai.\n\n` +
           `Order karne ke liye menu dekhein:\n\n` +
-          getMenuText();
+          menuText;
         break;
 
       case "THANKS":
-        response = 
+        response =
           `Aap ka shukriya! 🙏\n` +
-          `${restaurantInfo.name} ko visit karne ke liye!`;
+          `${business.name} ko visit karne ke liye!`;
         break;
 
       default:
-        response = 
+        response =
           `Maaf kijiye, samajh nahi saka. 🤔\n\n` +
           `Yeh karein:\n\n` +
           `📋 "menu" - menu dekhne ke liye\n` +
@@ -388,9 +429,8 @@ export async function getAIResponse(
     }
 
     history.push({ role: "assistant", content: response });
-    conversations.set(userPhone, history);
+    conversations.set(convKey, history);
     return response;
-
   } catch (error) {
     console.error("Agent error:", error);
     return "⚠️ Technical issue hai. Thori dair baad try karein.";

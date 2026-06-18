@@ -13,7 +13,8 @@ export default async function AdminPage() {
     redirect("/admin/login");
   }
 
-  const orders = await getTodaysOrders();
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID ?? "";
+  const orders = await getTodaysOrders(phoneNumberId);
   const totalRevenue = orders.reduce((sum, o) => sum + o.total, 0);
   const today = new Date().toLocaleDateString("en-US", {
     weekday: "long",

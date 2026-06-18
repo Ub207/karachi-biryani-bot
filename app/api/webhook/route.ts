@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { sendWhatsAppMessage, markAsRead } from "@/lib/whatsapp";
 import { getAIResponse } from "@/lib/agent";
+import { getClientConfig } from "@/lib/client-config";
 
 // Deduplicate processed messages
 const processedMessages = new Set<string>();
@@ -9,12 +10,12 @@ const processedMessages = new Set<string>();
 function isDuplicateMessage(messageId: string): boolean {
   if (processedMessages.has(messageId)) return true;
   processedMessages.add(messageId);
-  
+
   // Cleanup: keep only last 1000 IDs
   if (processedMessages.size > 1000) {
     const arr = Array.from(processedMessages);
     processedMessages.clear();
-    arr.slice(-500).forEach(id => processedMessages.add(id));
+    arr.slice(-500).forEach((id) => processedMessages.add(id));
   }
   return false;
 }
@@ -37,14 +38,13 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    
+
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
 
     // 🛑 Filter 1: Ignore status updates (delivered, read receipts)
     if (value?.statuses) {
-      console.log("Ignoring status update");
       return NextResponse.json({ status: "ok" });
     }
 
@@ -55,7 +55,7 @@ export async function POST(request: NextRequest) {
     }
 
     const message = messages[0];
-    
+
     // 🛑 Filter 3: Must have valid from + id
     if (!message.from || !message.id) {
       return NextResponse.json({ status: "ok" });
@@ -67,24 +67,37 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: "ok" });
     }
 
+    // Identify which client this message belongs to
+    const phoneNumberId: string =
+      value?.metadata?.phone_number_id ?? process.env.WHATSAPP_PHONE_NUMBER_ID ?? "";
+    if (!phoneNumberId) {
+      console.error("No phone_number_id in webhook payload and no env fallback");
+      return NextResponse.json({ status: "ok" });
+    }
+
+    const config = await getClientConfig(phoneNumberId);
+
     const from = message.from;
     const messageId = message.id;
     const messageType = message.type;
 
     // 🛑 Filter 5: Extract text from message types
     let userText = "";
-    
+
     if (messageType === "text" && message.text?.body) {
       userText = message.text.body.trim();
     } else if (messageType === "interactive") {
-      userText = message.interactive?.button_reply?.title || 
-                 message.interactive?.list_reply?.title || "";
+      userText =
+        message.interactive?.button_reply?.title ||
+        message.interactive?.list_reply?.title ||
+        "";
       userText = userText.trim();
     } else {
-      // Image, audio, video, sticker, document
       await sendWhatsAppMessage(
         from,
-        "Maaf kijiye, abhi sirf text messages handle karta hoon. Apna message text mein bhejein."
+        "Maaf kijiye, abhi sirf text messages handle karta hoon. Apna message text mein bhejein.",
+        config.whatsappToken,
+        phoneNumberId
       );
       return NextResponse.json({ status: "ok" });
     }
@@ -94,20 +107,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: "ok" });
     }
 
-    console.log(`📩 Message from ${from}: ${userText}`);
+    console.log(`📩 [${phoneNumberId}] Message from ${from}: ${userText}`);
 
-    // Mark as read
-    await markAsRead(messageId);
+    await markAsRead(messageId, config.whatsappToken, phoneNumberId);
 
-    // Get AI response
-    const aiReply = await getAIResponse(from, userText);
+    const aiReply = await getAIResponse(phoneNumberId, from, userText, config);
+    await sendWhatsAppMessage(from, aiReply, config.whatsappToken, phoneNumberId);
 
-    // Send reply
-    await sendWhatsAppMessage(from, aiReply);
-
-    console.log(`📤 Replied to ${from}`);
+    console.log(`📤 [${phoneNumberId}] Replied to ${from}`);
     return NextResponse.json({ status: "ok" });
-
   } catch (error) {
     console.error("❌ Webhook error:", error);
     return NextResponse.json({ error: "Internal error" }, { status: 500 });
