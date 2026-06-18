@@ -1,8 +1,10 @@
 // app/api/webhook/route.ts
+import { createHmac, timingSafeEqual } from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { sendWhatsAppMessage, markAsRead } from "@/lib/whatsapp";
 import { getAIResponse } from "@/lib/agent";
 import { getClientConfig } from "@/lib/client-config";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 // Deduplicate processed messages
 const processedMessages = new Set<string>();
@@ -11,13 +13,31 @@ function isDuplicateMessage(messageId: string): boolean {
   if (processedMessages.has(messageId)) return true;
   processedMessages.add(messageId);
 
-  // Cleanup: keep only last 1000 IDs
   if (processedMessages.size > 1000) {
     const arr = Array.from(processedMessages);
     processedMessages.clear();
     arr.slice(-500).forEach((id) => processedMessages.add(id));
   }
   return false;
+}
+
+function verifySignature(rawBody: string, signature: string | null): boolean {
+  const secret = process.env.WHATSAPP_APP_SECRET;
+  if (!secret) {
+    // Secret not configured — allow but warn. Set WHATSAPP_APP_SECRET to enforce.
+    console.warn("[webhook] WHATSAPP_APP_SECRET not set, skipping signature verification");
+    return true;
+  }
+  if (!signature) {
+    console.warn("[webhook] Missing X-Hub-Signature-256 header");
+    return false;
+  }
+  const expected = "sha256=" + createHmac("sha256", secret).update(rawBody).digest("hex");
+  try {
+    return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false; // lengths differ
+  }
 }
 
 // GET: Webhook verification
@@ -36,19 +56,27 @@ export async function GET(request: NextRequest) {
 
 // POST: Receive messages
 export async function POST(request: NextRequest) {
+  // Read raw body once — needed for both signature check and JSON parsing
+  const rawBody = await request.text();
+
+  if (!verifySignature(rawBody, request.headers.get("x-hub-signature-256"))) {
+    console.warn("[webhook] Rejected request: invalid signature");
+    return new NextResponse("Unauthorized", { status: 401 });
+  }
+
   try {
-    const body = await request.json();
+    const body = JSON.parse(rawBody);
 
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
 
-    // 🛑 Filter 1: Ignore status updates (delivered, read receipts)
+    // Filter 1: Ignore status updates (delivered, read receipts)
     if (value?.statuses) {
       return NextResponse.json({ status: "ok" });
     }
 
-    // 🛑 Filter 2: No messages = nothing to do
+    // Filter 2: No messages = nothing to do
     const messages = value?.messages;
     if (!messages || messages.length === 0) {
       return NextResponse.json({ status: "ok" });
@@ -56,12 +84,12 @@ export async function POST(request: NextRequest) {
 
     const message = messages[0];
 
-    // 🛑 Filter 3: Must have valid from + id
+    // Filter 3: Must have valid from + id
     if (!message.from || !message.id) {
       return NextResponse.json({ status: "ok" });
     }
 
-    // 🛑 Filter 4: Deduplicate
+    // Filter 4: Deduplicate
     if (isDuplicateMessage(message.id)) {
       console.log("Duplicate message, skipping:", message.id);
       return NextResponse.json({ status: "ok" });
@@ -75,13 +103,28 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: "ok" });
     }
 
+    const from: string = message.from;
+
+    // Filter 5: Per-user rate limiting (20 messages/hour)
+    const { allowed } = await checkRateLimit(phoneNumberId, from);
+    if (!allowed) {
+      console.warn(`[webhook] Rate limit exceeded for ${from} on client ${phoneNumberId}`);
+      const config = await getClientConfig(phoneNumberId);
+      await sendWhatsAppMessage(
+        from,
+        "Maaf kijiye, aap ne bahut zyada messages bheje hain. 1 ghante baad try karein. 🙏",
+        config.whatsappToken,
+        phoneNumberId
+      );
+      return NextResponse.json({ status: "ok" });
+    }
+
     const config = await getClientConfig(phoneNumberId);
 
-    const from = message.from;
-    const messageId = message.id;
-    const messageType = message.type;
+    const messageId: string = message.id;
+    const messageType: string = message.type;
 
-    // 🛑 Filter 5: Extract text from message types
+    // Filter 6: Extract text from message types
     let userText = "";
 
     if (messageType === "text" && message.text?.body) {
@@ -102,7 +145,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: "ok" });
     }
 
-    // 🛑 Filter 6: Empty messages
+    // Filter 7: Empty messages
     if (!userText) {
       return NextResponse.json({ status: "ok" });
     }

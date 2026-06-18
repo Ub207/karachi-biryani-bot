@@ -18,6 +18,7 @@ export type ClientConfig = {
     deliveryTime: string;
     currency: string;
     language?: string;
+    timezone?: string;
   };
   menu: MenuCategory[];
   responses?: Partial<{

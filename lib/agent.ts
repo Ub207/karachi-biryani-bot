@@ -1,6 +1,7 @@
 import Groq from "groq-sdk";
 import { ClientConfig, buildFlatMenu, buildMenuText } from "./client-config";
 import { savePendingOrder, confirmOrder } from "./orders";
+import { isRestaurantOpen, closedMessage } from "./hours";
 
 function getGroqClient() {
   return new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -11,8 +12,12 @@ type ConversationMessage = {
   content: string;
 };
 
+type ConversationEntry = { history: ConversationMessage[]; lastActiveAt: number };
+
 // Keyed by `${phoneNumberId}:${userPhone}` to isolate per-client conversations
-const conversations = new Map<string, ConversationMessage[]>();
+const conversations = new Map<string, ConversationEntry>();
+
+const CONVERSATION_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 function buildIntentPrompt(flatMenu: Record<string, number>): string {
   return `You are an intent classifier for a Pakistani restaurant WhatsApp bot.
@@ -230,7 +235,15 @@ export async function getAIResponse(
   const currency = business.currency;
   const convKey = `${phoneNumberId}:${userPhone}`;
 
-  let history = conversations.get(convKey) || [];
+  const existing = conversations.get(convKey);
+  let history: ConversationMessage[] = [];
+  if (existing) {
+    if (Date.now() - existing.lastActiveAt < CONVERSATION_EXPIRY_MS) {
+      history = existing.history;
+    } else {
+      console.log(`[agent] Conversation expired for ${convKey}, starting fresh`);
+    }
+  }
   history.push({ role: "user", content: userMessage });
 
   if (history.length > 20) {
@@ -314,6 +327,12 @@ export async function getAIResponse(
       }
 
       case "ORDER": {
+        const tz = business.timezone ?? 'Asia/Karachi';
+        if (!isRestaurantOpen(business.hours, tz)) {
+          response = closedMessage(business.name, business.hours);
+          break;
+        }
+
         const orderItems = intent.items || [];
         if (orderItems.length === 0) {
           response = "Kya order karna hai? Item ka naam aur quantity likhein.";
@@ -429,7 +448,7 @@ export async function getAIResponse(
     }
 
     history.push({ role: "assistant", content: response });
-    conversations.set(convKey, history);
+    conversations.set(convKey, { history, lastActiveAt: Date.now() });
     return response;
   } catch (error) {
     console.error("Agent error:", error);
