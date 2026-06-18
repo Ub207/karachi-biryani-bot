@@ -1,6 +1,7 @@
 // lib/agent.ts
 import Groq from "groq-sdk";
 import { flatMenu, restaurantInfo, getMenuText } from "./menu-data";
+import { savePendingOrder, confirmOrder } from "./orders";
 
 // Lazy initialization to avoid build-time errors
 function getGroqClient() {
@@ -307,11 +308,15 @@ export async function getAIResponse(
         if (!ambiguous) {
           try {
             const { subtotal, matched } = calculateOrder(orderItems);
+            const total = subtotal + restaurantInfo.deliveryFee;
             response = formatOrderConfirmation(matched, subtotal);
+            await savePendingOrder(userPhone, matched, subtotal, total).catch((err) =>
+              console.error("Failed to save pending order:", err)
+            );
           } catch (err: any) {
             const errorMsg = err.message || "";
             const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
-            response = 
+            response =
               `❌ Maaf kijiye, *${itemName}* available nahi hai.\n\n` +
               getMenuText();
           }
@@ -332,13 +337,19 @@ export async function getAIResponse(
         response = `Order cancel ho gaya. ❌\n\nAur kuch help chahiye? "menu" likhein.`;
         break;
 
-      case "ADDRESS":
-        response = 
+      case "ADDRESS": {
+        const order = await confirmOrder(userPhone, userMessage).catch((err) => {
+          console.error("Failed to confirm order:", err);
+          return null;
+        });
+        response =
           `✅ *Address note ho gaya!*\n\n` +
+          (order ? `📦 *Order ID: ${order.id}*\n\n` : "") +
           `📞 Confirmation call: ${restaurantInfo.phone}\n` +
           `🛵 Delivery time: ${restaurantInfo.deliveryTime}\n\n` +
           `Shukriya! 🙏`;
         break;
+      }
 
       case "COMPLAINT":
         response = 
