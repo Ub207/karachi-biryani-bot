@@ -41,18 +41,38 @@ export async function savePendingOrder(
   subtotal: number,
   total: number
 ): Promise<void> {
+  console.log(`[orders] savePendingOrder: phone=${phone} items=${items.length} total=${total}`);
   const redis = getRedis();
   const pending: PendingOrder = { items, subtotal, total };
-  await redis.setex(`pending:${phone}`, 3600, pending);
+  try {
+    const result = await redis.setex(`pending:${phone}`, 3600, pending);
+    console.log(`[orders] savePendingOrder: setex result=${JSON.stringify(result)}`);
+  } catch (err) {
+    console.error(`[orders] savePendingOrder FAILED for phone=${phone}:`, err);
+    throw err;
+  }
 }
 
 export async function confirmOrder(
   phone: string,
   address: string
 ): Promise<Order | null> {
+  console.log(`[orders] confirmOrder: phone=${phone}`);
   const redis = getRedis();
-  const pending = await redis.get<PendingOrder>(`pending:${phone}`);
-  if (!pending) return null;
+
+  let pending: PendingOrder | null;
+  try {
+    pending = await redis.get<PendingOrder>(`pending:${phone}`);
+    console.log(`[orders] confirmOrder: pending lookup result=${pending ? 'found' : 'null'}`);
+  } catch (err) {
+    console.error(`[orders] confirmOrder FAILED reading pending order for phone=${phone}:`, err);
+    throw err;
+  }
+
+  if (!pending) {
+    console.warn(`[orders] confirmOrder: no pending order found for phone=${phone}`);
+    return null;
+  }
 
   const order: Order = {
     id: generateOrderId(),
@@ -66,11 +86,17 @@ export async function confirmOrder(
   };
 
   const key = todayKey();
-  await Promise.all([
-    redis.set(`order:${order.id}`, order),
-    redis.rpush(`orders:${key}`, order.id),
-    redis.del(`pending:${phone}`),
-  ]);
+  try {
+    await Promise.all([
+      redis.set(`order:${order.id}`, order),
+      redis.rpush(`orders:${key}`, order.id),
+      redis.del(`pending:${phone}`),
+    ]);
+    console.log(`[orders] confirmOrder: saved order id=${order.id} key=orders:${key}`);
+  } catch (err) {
+    console.error(`[orders] confirmOrder FAILED saving order id=${order.id}:`, err);
+    throw err;
+  }
 
   return order;
 }

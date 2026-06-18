@@ -309,16 +309,19 @@ export async function getAIResponse(
           try {
             const { subtotal, matched } = calculateOrder(orderItems);
             const total = subtotal + restaurantInfo.deliveryFee;
+            await savePendingOrder(userPhone, matched, subtotal, total);
             response = formatOrderConfirmation(matched, subtotal);
-            await savePendingOrder(userPhone, matched, subtotal, total).catch((err) =>
-              console.error("Failed to save pending order:", err)
-            );
           } catch (err: any) {
             const errorMsg = err.message || "";
-            const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
-            response =
-              `❌ Maaf kijiye, *${itemName}* available nahi hai.\n\n` +
-              getMenuText();
+            if (errorMsg.startsWith("ITEM_NOT_FOUND:")) {
+              const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
+              response =
+                `❌ Maaf kijiye, *${itemName}* available nahi hai.\n\n` +
+                getMenuText();
+            } else {
+              console.error("Failed to save pending order:", err);
+              response = `⚠️ System error: order save karne mein masla hua. Thori dair baad try karein.`;
+            }
           }
         }
         break;
@@ -338,13 +341,23 @@ export async function getAIResponse(
         break;
 
       case "ADDRESS": {
-        const order = await confirmOrder(userPhone, userMessage).catch((err) => {
+        let order = null;
+        try {
+          order = await confirmOrder(userPhone, userMessage);
+        } catch (err) {
           console.error("Failed to confirm order:", err);
-          return null;
-        });
+          response = `⚠️ System error: order confirm karne mein masla hua. Thori dair baad try karein.`;
+          break;
+        }
+        if (!order) {
+          response =
+            `⚠️ Pending order nahi mila.\n\n` +
+            `Pehle apna order dein (e.g. "1 chicken biryani"), phir address bhejein.`;
+          break;
+        }
         response =
-          `✅ *Address note ho gaya!*\n\n` +
-          (order ? `📦 *Order ID: ${order.id}*\n\n` : "") +
+          `✅ *Order confirm ho gaya!*\n\n` +
+          `📦 *Order ID: ${order.id}*\n\n` +
           `📞 Confirmation call: ${restaurantInfo.phone}\n` +
           `🛵 Delivery time: ${restaurantInfo.deliveryTime}\n\n` +
           `Shukriya! 🙏`;
