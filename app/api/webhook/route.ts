@@ -150,6 +150,19 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: "ok" });
     }
 
+    console.log("🚨 LIVE-WHATSAPP-PRODUCTION-PATH-2026", {
+      rawText: userText,
+      normalizedText: userText.trim().toLowerCase().replace(/\s+/g, " "),
+      userId: from,
+      phoneNumberId,
+      rawMessage: JSON.stringify(message),
+      length: userText.length,
+      charCodes: [...userText].map(c => ({
+        char: c,
+        code: c.codePointAt(0)
+      }))
+    });
+
     console.log(`📩 [${phoneNumberId}] Message from ${from}: ${userText}`);
 
     await markAsRead(messageId, config.whatsappToken, phoneNumberId);

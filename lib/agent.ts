@@ -19,6 +19,99 @@ const conversations = new Map<string, ConversationEntry>();
 
 const CONVERSATION_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
 
+// A conversation is only "genuinely active" if the last interaction was recent.
+// Beyond this grace window we treat the old session as stale/inactive even if it
+// has not hit the hard expiry, so an apparently new message starts fresh.
+const CONVERSATION_ACTIVE_MS = 30 * 60 * 1000; // 30 minutes
+
+// Deterministic, rule-based greeting detection. Kept separate from the LLM
+// intent classifier so a fresh/new-session greeting is NEVER skipped.
+// This is the SINGLE source of truth for greeting detection.
+
+// Normalize punctuation/hyphens to spaces so "assalam-o-alaikum" and
+// "salam, kya haal?" both resolve the same way.
+function normalizeText(text: string): string {
+  if (!text) return "";
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[-–—.,!?;:'`"]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "");
+}
+
+function isGreetingMessage(text: string): boolean {
+  const normalized = normalizeText(text);
+  if (!normalized) return false;
+
+  // Arabic greeting substrings (kept before word-boundary regexes).
+  const arabicForms = [
+    "السلام عليكم",
+    "السلام علیکم",
+    "سلام عليكم",
+    "وعليكم السلام",
+  ];
+  if (arabicForms.some((g) => normalized.includes(g))) return true;
+
+  // Roman-Urdu / hybrid mappings normalized for "s", "a", "la", "ikum".
+  const compact = normalized.replace(/\s+/g, "");
+  const salamCompact = /^sala+m(alaikum|al[a]?ikum)?$/.test(compact);
+  const assalamCompact = /^s?alamual?al[i]?kum$|^ass?alamo?al[a]?ikum$/.test(compact);
+
+  if (salamCompact || assalamCompact) return true;
+
+  // Full-word / phrase forms mapped after normalization.
+  const phraseForms = [
+    "salam",
+    "salaam",
+    "salam alaikum",
+    "salamalaikum",
+    "asalamualaikum",
+    "assalamualaikum",
+    "assalamu alaikum",
+    "assalamo alaikum",
+    "assalam alaikum",
+    "assalam o alaikum",
+    "salaam alaikum",
+    "slm",
+    "hi",
+    "hello",
+    "hey",
+    "hola",
+  ];
+  if (phraseForms.includes(normalized)) return true;
+
+  // Tolerate greetings with extra trailing words, e.g. "salam kya haal".
+  if (/^salam( |alaikum|ualikum)/.test(normalized)) return true;
+
+  return false;
+}
+
+// Reset keywords — "reset", "restart", "start over", "shuru se", etc.
+const RESET_PATTERNS: RegExp[] = [
+  /\b(reset|restart|fresh\s*start)\b/i,
+  /\b(start\s*over|begin\s*again)\b/i,
+  /\b(shuru\s*se|shuru\s*kar|naya\s*shuru|dobara\s*shuru|waps\s*shuru)\b/i,
+];
+
+function isResetMessage(text: string): boolean {
+  const normalized = normalizeText(text);
+  if (!normalized) return false;
+  return RESET_PATTERNS.some((re) => re.test(normalized));
+}
+
+function buildGreetingResponse(config: ClientConfig): string {
+  return (
+    config.responses?.greeting ??
+    `*Wa alaikum assalam!* 🌙 [GREETING-V2]\n\n` +
+      `${config.business.name} mein khush amdeed! 🍛\n\n` +
+      `Main aap ki madad kar sakta hoon menu, biryani, prices aur order ke hawale se.\n\n` +
+      `📋 "menu" - menu dekhne ke liye\n` +
+      `🛒 "1 chicken biryani" - order karne ke liye\n` +
+      `💬 Item ka naam - rate puchne ke liye`
+  );
+}
+
 function buildIntentPrompt(flatMenu: Record<string, number>): string {
   return `You are an intent classifier for a Pakistani restaurant WhatsApp bot.
 
@@ -235,15 +328,58 @@ export async function getAIResponse(
   const currency = business.currency;
   const convKey = `${phoneNumberId}:${userPhone}`;
 
+  const now = Date.now();
   const existing = conversations.get(convKey);
+  let isNewSession = true;
   let history: ConversationMessage[] = [];
+
+  // Determine whether this is a genuinely active session.
+  // A session is only reused if it exists AND the last interaction is both
+  // within the hard expiry AND within the active grace window.
   if (existing) {
-    if (Date.now() - existing.lastActiveAt < CONVERSATION_EXPIRY_MS) {
+    const withinExpiry = now - existing.lastActiveAt < CONVERSATION_EXPIRY_MS;
+    const isActive = now - existing.lastActiveAt < CONVERSATION_ACTIVE_MS;
+    if (withinExpiry && isActive) {
       history = existing.history;
+      isNewSession = false;
     } else {
-      console.log(`[agent] Conversation expired for ${convKey}, starting fresh`);
+      console.log(
+        `[agent] Session for ${convKey} is stale/inactive (lastActive ${existing.lastActiveAt}), starting fresh`
+      );
     }
   }
+
+  console.log(
+    `[agent] Entry | user=${userPhone} | session=${convKey} | isNewSession=${isNewSession} | prevHistoryLen=${history.length}`
+  );
+
+  // Reset support: clear any existing state before proceeding.
+  if (isResetMessage(userMessage)) {
+    conversations.delete(convKey);
+    history = [];
+    isNewSession = true;
+    const resetMsg =
+      `🔄 Conversation reset ho gaya hai.\n\n` + buildGreetingResponse(config);
+    history.push({ role: "user", content: userMessage });
+    history.push({ role: "assistant", content: resetMsg });
+    conversations.set(convKey, { history, lastActiveAt: Date.now() });
+    console.log(`[agent] RESET | user=${userPhone} | session=${convKey} | nextState='fresh-greeting'`);
+    return resetMsg;
+  }
+
+  // Greeting detection happens BEFORE normal intent routing so a new/fresh
+  // session always starts from step 1 (greeting), never step 2.
+  if (isGreetingMessage(userMessage)) {
+    const greetingMsg = buildGreetingResponse(config);
+    history.push({ role: "user", content: userMessage });
+    history.push({ role: "assistant", content: greetingMsg });
+    conversations.set(convKey, { history, lastActiveAt: Date.now() });
+    console.log(
+      `[agent] GREETING | user=${userPhone} | session=${convKey} | isNewSession=${isNewSession} | nextState='greeting'`
+    );
+    return greetingMsg;
+  }
+
   history.push({ role: "user", content: userMessage });
 
   if (history.length > 20) {
@@ -254,18 +390,13 @@ export async function getAIResponse(
 
   try {
     const intent = await classifyIntent(userMessage, history, flatMenu);
-    console.log("Intent:", intent);
+    console.log(
+      `[agent] Intent | user=${userPhone} | session=${convKey} | detected=${intent.intent}`
+    );
 
     switch (intent.intent) {
       case "GREETING":
-        response =
-          config.responses?.greeting ??
-          `*Wa alaikum assalam!* 🌙\n\n` +
-            `${business.name} mein khush amdeed!\n\n` +
-            `Main aap ki kaise help kar sakta hoon?\n\n` +
-            `📋 "menu" - menu dekhne ke liye\n` +
-            `🛒 "1 chicken biryani" - order karne ke liye\n` +
-            `💬 Item ka naam - rate puchne ke liye`;
+        response = buildGreetingResponse(config);
         break;
 
       case "MENU":
@@ -439,6 +570,13 @@ export async function getAIResponse(
         break;
 
       default:
+        const norm = normalizeText(userMessage);
+        if (isGreetingMessage(userMessage)) {
+            console.error("BUG: Greeting reached fallback handler", {
+              rawMessage: userMessage,
+              normalizedMessage: norm
+            });
+        }
         response =
           `Maaf kijiye, samajh nahi saka. 🤔\n\n` +
           `Yeh karein:\n\n` +
@@ -449,6 +587,9 @@ export async function getAIResponse(
 
     history.push({ role: "assistant", content: response });
     conversations.set(convKey, { history, lastActiveAt: Date.now() });
+    console.log(
+      `[agent] State | user=${userPhone} | session=${convKey} | nextHistoryLen=${history.length}`
+    );
     return response;
   } catch (error) {
     console.error("Agent error:", error);
