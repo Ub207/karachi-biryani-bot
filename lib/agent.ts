@@ -30,7 +30,7 @@ const CONVERSATION_ACTIVE_MS = 30 * 60 * 1000; // 30 minutes
 
 // Normalize punctuation/hyphens to spaces so "assalam-o-alaikum" and
 // "salam, kya haal?" both resolve the same way.
-function normalizeText(text: string): string {
+export function normalizeText(text: string): string {
   if (!text) return "";
   return text
     .trim()
@@ -38,6 +38,37 @@ function normalizeText(text: string): string {
     .replace(/[-–—.,!?;:'`"]+/g, " ")
     .replace(/\s+/g, " ")
     .replace(/[^\p{L}\p{N}\s]/gu, "");
+}
+
+type IntentName =
+  | "GREETING"
+  | "MENU"
+  | "ORDER"
+  | "PRICE_QUERY"
+  | "ITEM_CHECK"
+  | "CONFIRM"
+  | "CANCEL"
+  | "ADDRESS"
+  | "COMPLAINT"
+  | "THANKS"
+  | "UNKNOWN";
+
+type IntentResult = { intent: IntentName; items: OrderItem[] };
+
+type DeterministicRoute =
+  | { kind: "intent"; intent: IntentResult }
+  | { kind: "ambiguous"; itemName: string; matches: string[] }
+  | { kind: "unavailable"; itemName: string };
+
+const INTENTS = new Set<IntentName>([
+  "GREETING", "MENU", "ORDER", "PRICE_QUERY", "ITEM_CHECK",
+  "CONFIRM", "CANCEL", "ADDRESS", "COMPLAINT", "THANKS", "UNKNOWN",
+]);
+
+function isMenuRequest(message: string): boolean {
+  return ["menu", "show menu", "send menu", "full menu", "menu please"].includes(
+    normalizeText(message)
+  );
 }
 
 function isGreetingMessage(text: string): boolean {
@@ -178,6 +209,84 @@ function extractJSON(text: string): any {
   return { intent: "UNKNOWN", items: [] };
 }
 
+export function normalizeIntent(value: unknown): IntentName {
+  const intent = String(value ?? "UNKNOWN").trim().toUpperCase();
+  return INTENTS.has(intent as IntentName) ? (intent as IntentName) : "UNKNOWN";
+}
+
+export function parseIntentResponse(text: string): IntentResult {
+  const parsed = extractJSON(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { intent: "UNKNOWN", items: [] };
+  }
+
+  const items = Array.isArray(parsed.items)
+    ? parsed.items.flatMap((item: unknown) => {
+        if (!item || typeof item !== "object" || typeof (item as { name?: unknown }).name !== "string") {
+          return [];
+        }
+        const name = (item as { name: string }).name.trim();
+        const quantity = Number((item as { qty?: unknown }).qty);
+        if (!name || !Number.isSafeInteger(quantity) || quantity <= 0) return [];
+        return [{ name, qty: quantity }];
+      })
+    : [];
+
+  return { intent: normalizeIntent(parsed.intent), items };
+}
+
+function parseDeterministicOrder(message: string): OrderItem[] | null {
+  const normalized = normalizeText(message);
+  if (!/^\d+\s*(?:x\s*)?\S/.test(normalized)) return null;
+
+  const segments = message.split(/\s*(?:,|\band\b|\baur\b)\s*/i);
+  const items: OrderItem[] = [];
+
+  for (const segment of segments) {
+    const normalizedSegment = normalizeText(segment);
+    const match = normalizedSegment.match(/^(\d+)\s*(?:x\s*)?(.+)$/);
+    if (!match) return null;
+    const qty = Number(match[1]);
+    const name = match[2].trim();
+    if (!Number.isSafeInteger(qty) || qty < 1 || qty > 99 || !name) return null;
+    items.push({ name, qty });
+  }
+
+  return items.length > 0 ? items : null;
+}
+
+export function routeDeterministically(
+  message: string,
+  flatMenu: Record<string, number>
+): DeterministicRoute | null {
+  if (isMenuRequest(message)) {
+    return { kind: "intent", intent: { intent: "MENU", items: [] } };
+  }
+
+  const orderItems = parseDeterministicOrder(message);
+  if (!orderItems) return null;
+
+  const resolvedItems: OrderItem[] = [];
+  for (const item of orderItems) {
+    const matches = findAllMatches(item.name, flatMenu);
+    const normalizedItem = normalizeText(item.name);
+    const exact = matches.find((match) => normalizeText(match) === normalizedItem);
+    const singleServing = matches.find(
+      (match) => normalizeText(match).replace(/\bsingle\b/, "").trim() === normalizedItem
+    );
+    if (matches.length > 1 && !exact && !singleServing) {
+      return { kind: "ambiguous", itemName: item.name, matches };
+    }
+    const resolved = exact ?? singleServing ?? findMenuItem(item.name, flatMenu);
+    if (!resolved) {
+      return { kind: "unavailable", itemName: item.name };
+    }
+    resolvedItems.push({ name: resolved, qty: item.qty });
+  }
+
+  return { kind: "intent", intent: { intent: "ORDER", items: resolvedItems } };
+}
+
 async function classifyIntent(
   message: string,
   history: ConversationMessage[],
@@ -204,10 +313,10 @@ async function classifyIntent(
       ],
     });
 
-    return extractJSON(res.choices[0]?.message?.content || "{}");
+    return parseIntentResponse(res.choices[0]?.message?.content || "{}");
   } catch (err) {
-    console.error("Intent error:", err);
-    return { intent: "UNKNOWN", items: [] };
+    console.error("[agent] Intent classification failed:", err);
+    throw err;
   }
 }
 
@@ -353,6 +462,17 @@ export async function getAIResponse(
     `[agent] Entry | user=${userPhone} | session=${convKey} | isNewSession=${isNewSession} | prevHistoryLen=${history.length}`
   );
 
+  const finish = (response: string) => {
+    history.push({ role: "user", content: userMessage });
+    history.push({ role: "assistant", content: response });
+    history = history.slice(-20);
+    conversations.set(convKey, { history, lastActiveAt: Date.now() });
+    console.log(
+      `[agent] State | user=${userPhone} | session=${convKey} | nextHistoryLen=${history.length}`
+    );
+    return response;
+  };
+
   // Reset support: clear any existing state before proceeding.
   if (isResetMessage(userMessage)) {
     conversations.delete(convKey);
@@ -360,36 +480,40 @@ export async function getAIResponse(
     isNewSession = true;
     const resetMsg =
       `🔄 Conversation reset ho gaya hai.\n\n` + buildGreetingResponse(config);
-    history.push({ role: "user", content: userMessage });
-    history.push({ role: "assistant", content: resetMsg });
-    conversations.set(convKey, { history, lastActiveAt: Date.now() });
     console.log(`[agent] RESET | user=${userPhone} | session=${convKey} | nextState='fresh-greeting'`);
-    return resetMsg;
+    return finish(resetMsg);
   }
 
   // Greeting detection happens BEFORE normal intent routing so a new/fresh
   // session always starts from step 1 (greeting), never step 2.
   if (isGreetingMessage(userMessage)) {
     const greetingMsg = buildGreetingResponse(config);
-    history.push({ role: "user", content: userMessage });
-    history.push({ role: "assistant", content: greetingMsg });
-    conversations.set(convKey, { history, lastActiveAt: Date.now() });
     console.log(
       `[agent] GREETING | user=${userPhone} | session=${convKey} | isNewSession=${isNewSession} | nextState='greeting'`
     );
-    return greetingMsg;
+    return finish(greetingMsg);
   }
 
-  history.push({ role: "user", content: userMessage });
-
-  if (history.length > 20) {
-    history = history.slice(-20);
+  const deterministicRoute = routeDeterministically(userMessage, flatMenu);
+  if (deterministicRoute?.kind === "ambiguous") {
+    return finish(
+      `🤔 "${deterministicRoute.itemName}" mein kaunsa chahiye?\n\n` +
+        deterministicRoute.matches
+          .map((item, index) => `${index + 1}. ${item} - ${currency} ${flatMenu[item]}`)
+          .join("\n") +
+        `\n\nFull naam likh kar bhejein.`
+    );
+  }
+  if (deterministicRoute?.kind === "unavailable") {
+    return finish(
+      `❌ Maaf kijiye, *${deterministicRoute.itemName}* available nahi hai.\n\n${menuText}`
+    );
   }
 
   let response = "";
 
   try {
-    const intent = await classifyIntent(userMessage, history, flatMenu);
+    const intent = deterministicRoute?.intent ?? await classifyIntent(userMessage, history, flatMenu);
     console.log(
       `[agent] Intent | user=${userPhone} | session=${convKey} | detected=${intent.intent}`
     );
@@ -585,14 +709,9 @@ export async function getAIResponse(
           `💬 Item ka naam - rate ke liye`;
     }
 
-    history.push({ role: "assistant", content: response });
-    conversations.set(convKey, { history, lastActiveAt: Date.now() });
-    console.log(
-      `[agent] State | user=${userPhone} | session=${convKey} | nextHistoryLen=${history.length}`
-    );
-    return response;
+    return finish(response);
   } catch (error) {
-    console.error("Agent error:", error);
-    return "⚠️ Technical issue hai. Thori dair baad try karein.";
+    console.error("[agent] Response generation failed:", error);
+    return finish("⚠️ Technical issue hai. Thori dair baad try karein.");
   }
 }

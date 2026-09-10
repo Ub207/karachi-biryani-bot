@@ -23,21 +23,18 @@ function isDuplicateMessage(messageId: string): boolean {
 
 function verifySignature(rawBody: string, signature: string | null): boolean {
   const secret = process.env.WHATSAPP_APP_SECRET;
-  if (!secret) {
-    // Secret not configured — allow but warn. Set WHATSAPP_APP_SECRET to enforce.
-    console.warn("[webhook] WHATSAPP_APP_SECRET not set, skipping signature verification");
-    return true;
+  if (!secret?.trim()) {
+    console.error("[webhook] WHATSAPP_APP_SECRET is not configured");
+    return false;
   }
-  if (!signature) {
-    console.warn("[webhook] Missing X-Hub-Signature-256 header");
+  if (!signature?.startsWith("sha256=")) {
+    console.warn("[webhook] Missing or malformed X-Hub-Signature-256 header");
     return false;
   }
   const expected = "sha256=" + createHmac("sha256", secret).update(rawBody).digest("hex");
-  try {
-    return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch {
-    return false; // lengths differ
-  }
+  const received = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return received.length === expectedBuffer.length && timingSafeEqual(received, expectedBuffer);
 }
 
 // GET: Webhook verification

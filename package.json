@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --import tsx --test app/api/webhook/route.test.ts lib/agent.test.ts"
   },
   "dependencies": {
     "@upstash/redis": "^1.38.0",
