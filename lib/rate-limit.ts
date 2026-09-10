@@ -8,6 +8,9 @@ export async function checkRateLimit(
   phone: string
 ): Promise<{ allowed: boolean }> {
   const redis = getRedis();
+  if (!redis) {
+    return { allowed: true };
+  }
   const window = Math.floor(Date.now() / (WINDOW_SECONDS * 1000));
   const key = `ratelimit:${phoneNumberId}:${phone}:${window}`;
 

@@ -56,13 +56,16 @@ export function buildMenuText(config: ClientConfig): string {
 export async function getClientConfig(phoneNumberId: string): Promise<ClientConfig> {
   try {
     const redis = getRedis();
-    const stored = await redis.get<ClientConfig>(`config:${phoneNumberId}`);
-    if (stored) {
-      console.log(`[client-config] Loaded Redis config for ${phoneNumberId}`);
-      return stored;
+    if (redis) {
+      console.log(`🔍 [REDIS LOOKUP] Fetching config for phoneNumberId: ${phoneNumberId}`);
+      const stored = await redis.get<ClientConfig>(`config:${phoneNumberId}`);
+      if (stored) {
+        console.log(`✅ [REDIS LOOKUP] Loaded Redis config for ${phoneNumberId}`);
+        return stored;
+      }
     }
   } catch (err) {
-    console.error(`[client-config] Redis lookup failed for ${phoneNumberId}:`, err);
+    console.error(`❌ [REDIS LOOKUP ERROR] Lookup failed for ${phoneNumberId}:`, err);
   }
   console.log(`[client-config] Using default config.json for ${phoneNumberId}`);
   return {

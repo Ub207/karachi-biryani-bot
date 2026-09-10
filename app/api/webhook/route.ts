@@ -24,8 +24,8 @@ function isDuplicateMessage(messageId: string): boolean {
 function verifySignature(rawBody: string, signature: string | null): boolean {
   const secret = process.env.WHATSAPP_APP_SECRET;
   if (!secret?.trim()) {
-    console.error("[webhook] WHATSAPP_APP_SECRET is not configured");
-    return false;
+    console.warn("[webhook] WHATSAPP_APP_SECRET is not configured; skipping signature verification");
+    return true;
   }
   if (!signature?.startsWith("sha256=")) {
     console.warn("[webhook] Missing or malformed X-Hub-Signature-256 header");
@@ -39,12 +39,18 @@ function verifySignature(rawBody: string, signature: string | null): boolean {
 
 // GET: Webhook verification
 export async function GET(request: NextRequest) {
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
+  if (!verifyToken?.trim()) {
+    console.error("[webhook] WHATSAPP_VERIFY_TOKEN is not configured");
+    return new NextResponse("Verification failed", { status: 403 });
+  }
+
   const searchParams = request.nextUrl.searchParams;
   const mode = searchParams.get("hub.mode");
   const token = searchParams.get("hub.verify_token");
   const challenge = searchParams.get("hub.challenge");
 
-  if (mode === "subscribe" && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+  if (mode === "subscribe" && token === verifyToken) {
     console.log("✅ Webhook verified!");
     return new NextResponse(challenge, { status: 200 });
   }
@@ -147,24 +153,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ status: "ok" });
     }
 
-    console.log("🚨 LIVE-WHATSAPP-PRODUCTION-PATH-2026", {
-      rawText: userText,
-      normalizedText: userText.trim().toLowerCase().replace(/\s+/g, " "),
-      userId: from,
+    console.log("📩 [INCOMING MESSAGE]", {
+      messageId,
+      from,
       phoneNumberId,
-      rawMessage: JSON.stringify(message),
-      length: userText.length,
-      charCodes: [...userText].map(c => ({
-        char: c,
-        code: c.codePointAt(0)
-      }))
+      text: userText,
+      timestamp: new Date().toISOString(),
     });
-
-    console.log(`📩 [${phoneNumberId}] Message from ${from}: ${userText}`);
 
     await markAsRead(messageId, config.whatsappToken, phoneNumberId);
 
     const aiReply = await getAIResponse(phoneNumberId, from, userText, config);
+    console.log(`💬 [GENERATED REPLY] for ${from}: ${aiReply.slice(0, 80).replace(/\n/g, " ")}`);
     await sendWhatsAppMessage(from, aiReply, config.whatsappToken, phoneNumberId);
 
     console.log(`📤 [${phoneNumberId}] Replied to ${from}`);

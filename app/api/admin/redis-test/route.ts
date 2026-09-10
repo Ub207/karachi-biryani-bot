@@ -15,6 +15,10 @@ export async function GET() {
 
   try {
     const redis = getRedis();
+    if (!redis) {
+      results.error = "UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN environment variables not configured";
+      return NextResponse.json({ status: "error", results }, { status: 500 });
+    }
 
     const pingResult = await redis.ping();
     results.ping = String(pingResult);
@@ -29,8 +33,8 @@ export async function GET() {
     results.del = "ok";
 
     return NextResponse.json({ status: "ok", results });
-  } catch (err: any) {
-    results.error = err?.message || String(err);
+  } catch (err: unknown) {
+    results.error = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ status: "error", results }, { status: 500 });
   }
 }

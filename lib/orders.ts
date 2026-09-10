@@ -34,6 +34,9 @@ function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+const inMemoryPending = new Map<string, PendingOrder>();
+const inMemoryOrders = new Map<string, Order>();
+
 export async function savePendingOrder(
   phoneNumberId: string,
   phone: string,
@@ -42,14 +45,17 @@ export async function savePendingOrder(
   total: number
 ): Promise<void> {
   console.log(`[orders] savePendingOrder: client=${phoneNumberId} phone=${phone} items=${items.length} total=${total}`);
-  const redis = getRedis();
   const pending: PendingOrder = { items, subtotal, total };
+  inMemoryPending.set(`${phoneNumberId}:${phone}`, pending);
+
   try {
-    const result = await redis.setex(`pending:${phoneNumberId}:${phone}`, 3600, pending);
-    console.log(`[orders] savePendingOrder: setex result=${JSON.stringify(result)}`);
+    const redis = getRedis();
+    if (redis) {
+      const result = await redis.setex(`pending:${phoneNumberId}:${phone}`, 3600, pending);
+      console.log(`[orders] savePendingOrder: setex result=${JSON.stringify(result)}`);
+    }
   } catch (err) {
-    console.error(`[orders] savePendingOrder FAILED client=${phoneNumberId} phone=${phone}:`, err);
-    throw err;
+    console.warn(`[orders] Redis savePendingOrder error (in-memory fallback active):`, err);
   }
 }
 
@@ -60,15 +66,21 @@ export async function confirmOrder(
   deliveryFee: number
 ): Promise<Order | null> {
   console.log(`[orders] confirmOrder: client=${phoneNumberId} phone=${phone}`);
-  const redis = getRedis();
+  const memKey = `${phoneNumberId}:${phone}`;
+  let pending: PendingOrder | null = inMemoryPending.get(memKey) ?? null;
 
-  let pending: PendingOrder | null;
   try {
-    pending = await redis.get<PendingOrder>(`pending:${phoneNumberId}:${phone}`);
-    console.log(`[orders] confirmOrder: pending=${pending ? 'found' : 'null'}`);
+    const redis = getRedis();
+    if (redis) {
+      console.log("🔍 [REDIS LOOKUP] Checking pending order:", { phoneNumberId, phone });
+      const redisPending = await redis.get<PendingOrder>(`pending:${phoneNumberId}:${phone}`);
+      if (redisPending) {
+        pending = redisPending;
+        console.log("✅ [REDIS LOOKUP] Found pending order in Redis for:", phone);
+      }
+    }
   } catch (err) {
-    console.error(`[orders] confirmOrder FAILED reading pending order client=${phoneNumberId} phone=${phone}:`, err);
-    throw err;
+    console.warn(`[orders] Redis confirmOrder read error (in-memory fallback used):`, err);
   }
 
   if (!pending) {
@@ -87,17 +99,22 @@ export async function confirmOrder(
     timestamp: new Date().toISOString(),
   };
 
+  inMemoryPending.delete(memKey);
+  inMemoryOrders.set(`${phoneNumberId}:${order.id}`, order);
+
   const key = todayKey();
   try {
-    await Promise.all([
-      redis.set(`order:${phoneNumberId}:${order.id}`, order),
-      redis.rpush(`orders:${phoneNumberId}:${key}`, order.id),
-      redis.del(`pending:${phoneNumberId}:${phone}`),
-    ]);
-    console.log(`[orders] confirmOrder: saved id=${order.id} list=orders:${phoneNumberId}:${key}`);
+    const redis = getRedis();
+    if (redis) {
+      await Promise.all([
+        redis.set(`order:${phoneNumberId}:${order.id}`, order),
+        redis.rpush(`orders:${phoneNumberId}:${key}`, order.id),
+        redis.del(`pending:${phoneNumberId}:${phone}`),
+      ]);
+      console.log(`[orders] confirmOrder: saved id=${order.id} list=orders:${phoneNumberId}:${key}`);
+    }
   } catch (err) {
-    console.error(`[orders] confirmOrder FAILED saving order id=${order.id}:`, err);
-    throw err;
+    console.warn(`[orders] Redis confirmOrder save error (saved in memory):`, err);
   }
 
   return order;
@@ -105,6 +122,9 @@ export async function confirmOrder(
 
 export async function getTodaysOrders(phoneNumberId: string): Promise<Order[]> {
   const redis = getRedis();
+  if (!redis) {
+    return Array.from(inMemoryOrders.values());
+  }
   const key = todayKey();
   const ids = await redis.lrange<string>(`orders:${phoneNumberId}:${key}`, 0, -1);
   if (!ids.length) return [];

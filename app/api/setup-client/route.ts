@@ -79,6 +79,9 @@ export async function POST(request: NextRequest) {
 
   try {
     const redis = getRedis();
+    if (!redis) {
+      return err("Upstash Redis is not configured", 500);
+    }
     await redis.set(`config:${phone_number_id}`, config);
     console.log(`[setup-client] Saved config for phone_number_id=${phone_number_id}`);
   } catch (redisErr) {
@@ -90,6 +93,6 @@ export async function POST(request: NextRequest) {
     ok: true,
     phone_number_id,
     business_name: config.business.name,
-    menu_items: menu.reduce((n: number, c: any) => n + c.items.length, 0),
+    menu_items: menu.reduce((n: number, c: { items: unknown[] }) => n + c.items.length, 0),
   });
 }

@@ -33,25 +33,41 @@ export async function sendWhatsAppMessage(
   token: string,
   phoneNumberId: string
 ) {
+  console.log("📤 [SEND MESSAGE REQUEST]", {
+    to,
+    phoneNumberId,
+    preview: message.slice(0, 80).replace(/\n/g, " "),
+    length: message.length,
+  });
+
   try {
     const response = await doSend(to, message, token, phoneNumberId);
-    console.log("Message sent successfully");
+    console.log("📥 [SEND MESSAGE RESPONSE]", {
+      to,
+      status: response.status,
+      data: response.data,
+    });
     return response.data;
-  } catch (firstErr: any) {
-    const status: number | undefined = firstErr.response?.status;
-    // 4xx = client error (bad token, invalid number, etc.) — retrying won't help
+  } catch (firstErr: unknown) {
+    const axiosErr = firstErr as { response?: { status?: number; data?: unknown }; message?: string };
+    const status: number | undefined = axiosErr.response?.status;
     if (status && status >= 400 && status < 500) {
-      console.error("WhatsApp send error (4xx, no retry):", firstErr.response?.data || firstErr.message);
+      console.error("❌ [SEND MESSAGE ERROR] WhatsApp send error (4xx, no retry):", axiosErr.response?.data || axiosErr.message);
       throw firstErr;
     }
-    console.warn(`WhatsApp send failed (${status ?? "network error"}), retrying in 2s…`);
+    console.warn(`⚠️ [SEND MESSAGE RETRY] WhatsApp send failed (${status ?? "network error"}), retrying in 2s…`);
     await sleep(2000);
     try {
       const response = await doSend(to, message, token, phoneNumberId);
-      console.log("Message sent successfully (retry)");
+      console.log("📥 [SEND MESSAGE RESPONSE RETRY]", {
+        to,
+        status: response.status,
+        data: response.data,
+      });
       return response.data;
-    } catch (retryErr: any) {
-      console.error("WhatsApp send error (after retry):", retryErr.response?.data || retryErr.message);
+    } catch (retryErr: unknown) {
+      const retryAxiosErr = retryErr as { response?: { status?: number; data?: unknown }; message?: string };
+      console.error("❌ [SEND MESSAGE RETRY FAILED] WhatsApp send error (after retry):", retryAxiosErr.response?.data || retryAxiosErr.message);
       throw retryErr;
     }
   }

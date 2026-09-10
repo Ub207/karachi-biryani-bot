@@ -66,9 +66,53 @@ const INTENTS = new Set<IntentName>([
 ]);
 
 function isMenuRequest(message: string): boolean {
-  return ["menu", "show menu", "send menu", "full menu", "menu please"].includes(
-    normalizeText(message)
+  const norm = normalizeText(message);
+  const menuPhrases = [
+    "menu", "show menu", "send menu", "full menu", "menu please",
+    "menu card", "bhejo menu", "menu dikhao", "menu bhejo",
+    "rate list", "rates", "rate", "prices", "price", "price list",
+    "list", "items", "kya items hain",
+    "kya hai menu mein", "menu kya hai", "menu list"
+  ];
+  return (
+    menuPhrases.includes(norm) ||
+    norm.startsWith("menu ") ||
+    norm.endsWith(" menu") ||
+    norm.includes("menu card") ||
+    norm.includes("rate list")
   );
+}
+
+function isConfirmMessage(message: string): boolean {
+  const norm = normalizeText(message);
+  const confirmWords = [
+    "haan", "han", "ha", "haa", "hnn", "yes", "yep", "yeah", "yup",
+    "ok", "okay", "theek hai", "thik hai", "theek", "thik",
+    "confirm", "confirmed", "ji haan", "ji", "jee", "sure", "bilkul",
+    "kar do", "bhej do", "bhejo", "done", "order confirm", "confirm order",
+    "theek hai bhej do", "haan bhej do", "haan confirm"
+  ];
+  return confirmWords.includes(norm);
+}
+
+function isCancelMessage(message: string): boolean {
+  const norm = normalizeText(message);
+  const cancelWords = [
+    "nahi", "nahin", "nhi", "na", "no", "nope",
+    "cancel", "canceled", "mat karo", "rehne do",
+    "cancel order", "cancel kar do", "order cancel"
+  ];
+  return cancelWords.includes(norm);
+}
+
+function isThanksMessage(message: string): boolean {
+  const norm = normalizeText(message);
+  const thanksWords = [
+    "shukria", "shukriya", "thanks", "thank you", "thx",
+    "jazakallah", "jazak allah", "jazakallahu khair", "dhanyawad",
+    "bohot shukriya", "bahut shukriya"
+  ];
+  return thanksWords.includes(norm);
 }
 
 function isGreetingMessage(text: string): boolean {
@@ -194,7 +238,7 @@ User: "shukria"
 {"intent": "THANKS", "items": []}`;
 }
 
-function extractJSON(text: string): any {
+function extractJSON(text: string): unknown {
   try {
     return JSON.parse(text);
   } catch {}
@@ -220,8 +264,9 @@ export function parseIntentResponse(text: string): IntentResult {
     return { intent: "UNKNOWN", items: [] };
   }
 
-  const items = Array.isArray(parsed.items)
-    ? parsed.items.flatMap((item: unknown) => {
+  const record = parsed as Record<string, unknown>;
+  const items = Array.isArray(record.items)
+    ? record.items.flatMap((item: unknown) => {
         if (!item || typeof item !== "object" || typeof (item as { name?: unknown }).name !== "string") {
           return [];
         }
@@ -232,23 +277,67 @@ export function parseIntentResponse(text: string): IntentResult {
       })
     : [];
 
-  return { intent: normalizeIntent(parsed.intent), items };
+  return { intent: normalizeIntent(record.intent), items };
 }
 
-function parseDeterministicOrder(message: string): OrderItem[] | null {
+function parseDeterministicOrder(
+  message: string,
+  flatMenu?: Record<string, number>
+): OrderItem[] | null {
   const normalized = normalizeText(message);
-  if (!/^\d+\s*(?:x\s*)?\S/.test(normalized)) return null;
+  if (!normalized) return null;
 
-  const segments = message.split(/\s*(?:,|\band\b|\baur\b)\s*/i);
+  if (
+    isGreetingMessage(message) ||
+    isMenuRequest(message) ||
+    isConfirmMessage(message) ||
+    isCancelMessage(message) ||
+    isThanksMessage(message) ||
+    isResetMessage(message)
+  ) {
+    return null;
+  }
+
+  const segments = message.split(/\s*(?:,|\band\b|\baur\b|\+|\&|\n)\s*/i).filter((s) => s.trim().length > 0);
   const items: OrderItem[] = [];
 
   for (const segment of segments) {
-    const normalizedSegment = normalizeText(segment);
-    const match = normalizedSegment.match(/^(\d+)\s*(?:x\s*)?(.+)$/);
-    if (!match) return null;
-    const qty = Number(match[1]);
-    const name = match[2].trim();
-    if (!Number.isSafeInteger(qty) || qty < 1 || qty > 99 || !name) return null;
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+
+    const normalizedSegment = normalizeText(trimmed);
+    const leadingMatch = normalizedSegment.match(/^(\d+)\s*(?:x\s*)?(.+)$/);
+    const trailingMatch = normalizedSegment.match(/^(.+?)\s*(?:x\s*)?(\d+)$/);
+
+    let qty = 1;
+    let name = "";
+
+    if (leadingMatch) {
+      qty = Number(leadingMatch[1]);
+      name = leadingMatch[2].trim();
+    } else if (trailingMatch) {
+      name = trailingMatch[1].trim();
+      qty = Number(trailingMatch[2]);
+    } else {
+      name = trimmed;
+      qty = 1;
+    }
+
+    if (!Number.isSafeInteger(qty) || qty < 1 || qty > 99 || !name) {
+      return null;
+    }
+
+    if (!leadingMatch && !trailingMatch) {
+      if (flatMenu) {
+        const matches = findAllMatches(name, flatMenu);
+        if (matches.length === 0) {
+          return null;
+        }
+      } else {
+        return null;
+      }
+    }
+
     items.push({ name, qty });
   }
 
@@ -257,13 +346,36 @@ function parseDeterministicOrder(message: string): OrderItem[] | null {
 
 export function routeDeterministically(
   message: string,
-  flatMenu: Record<string, number>
+  flatMenu: Record<string, number>,
+  lastAssistantMessage?: string
 ): DeterministicRoute | null {
   if (isMenuRequest(message)) {
     return { kind: "intent", intent: { intent: "MENU", items: [] } };
   }
 
-  const orderItems = parseDeterministicOrder(message);
+  if (isConfirmMessage(message)) {
+    return { kind: "intent", intent: { intent: "CONFIRM", items: [] } };
+  }
+
+  if (isCancelMessage(message)) {
+    return { kind: "intent", intent: { intent: "CANCEL", items: [] } };
+  }
+
+  if (isThanksMessage(message)) {
+    return { kind: "intent", intent: { intent: "THANKS", items: [] } };
+  }
+
+  // If the bot previously asked for the delivery address
+  if (
+    lastAssistantMessage &&
+    (lastAssistantMessage.includes("delivery address") ||
+     lastAssistantMessage.includes("address kya hai") ||
+     lastAssistantMessage.includes("address bhejein"))
+  ) {
+    return { kind: "intent", intent: { intent: "ADDRESS", items: [] } };
+  }
+
+  const orderItems = parseDeterministicOrder(message, flatMenu);
   if (!orderItems) return null;
 
   const resolvedItems: OrderItem[] = [];
@@ -302,6 +414,7 @@ async function classifyIntent(
     : `User message: ${message}`;
 
   try {
+    console.log("🤖 [AI CALL] Invoking Groq LLM (llama-3.3-70b-versatile)...", { message });
     const groq = getGroqClient();
     const res = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
@@ -313,9 +426,11 @@ async function classifyIntent(
       ],
     });
 
-    return parseIntentResponse(res.choices[0]?.message?.content || "{}");
+    const parsed = parseIntentResponse(res.choices[0]?.message?.content || "{}");
+    console.log("🤖 [AI RESPONSE] Groq intent result:", parsed);
+    return parsed;
   } catch (err) {
-    console.error("[agent] Intent classification failed:", err);
+    console.error("❌ [AI ERROR] Intent classification failed:", err);
     throw err;
   }
 }
@@ -353,11 +468,15 @@ function findAllMatches(
 ): string[] {
   if (!searchName) return [];
   const search = searchName.toLowerCase().trim();
-  return Object.keys(flatMenu).filter(
-    (k) =>
-      k.toLowerCase().includes(search) ||
-      search.split(/\s+/).some((w) => w.length > 2 && k.toLowerCase().includes(w))
-  );
+  const searchWords = search.split(/\s+/).filter((w) => w.length > 0);
+  return Object.keys(flatMenu).filter((k) => {
+    const itemLower = k.toLowerCase();
+    if (itemLower.includes(search)) return true;
+    if (searchWords.length > 1) {
+      return searchWords.every((w) => itemLower.includes(w));
+    }
+    return searchWords.some((w) => w.length > 2 && itemLower.includes(w));
+  });
 }
 
 type OrderItem = { name: string; qty: number };
@@ -494,7 +613,8 @@ export async function getAIResponse(
     return finish(greetingMsg);
   }
 
-  const deterministicRoute = routeDeterministically(userMessage, flatMenu);
+  const lastAssistantMsg = history.filter((h) => h.role === "assistant").slice(-1)[0]?.content;
+  const deterministicRoute = routeDeterministically(userMessage, flatMenu, lastAssistantMsg);
   if (deterministicRoute?.kind === "ambiguous") {
     return finish(
       `🤔 "${deterministicRoute.itemName}" mein kaunsa chahiye?\n\n` +
@@ -514,9 +634,13 @@ export async function getAIResponse(
 
   try {
     const intent = deterministicRoute?.intent ?? await classifyIntent(userMessage, history, flatMenu);
-    console.log(
-      `[agent] Intent | user=${userPhone} | session=${convKey} | detected=${intent.intent}`
-    );
+    console.log("🎯 [DETECTED INTENT]", {
+      user: userPhone,
+      session: convKey,
+      intent: intent.intent,
+      deterministic: Boolean(deterministicRoute),
+      items: intent.items,
+    });
 
     switch (intent.intent) {
       case "GREETING":
@@ -620,8 +744,8 @@ export async function getAIResponse(
             const total = subtotal + business.deliveryFee;
             await savePendingOrder(phoneNumberId, userPhone, matched, subtotal, total);
             response = formatOrderConfirmation(matched, subtotal, config);
-          } catch (err: any) {
-            const errorMsg = err.message || "";
+          } catch (err: unknown) {
+            const errorMsg = err instanceof Error ? err.message : String(err || "");
             if (errorMsg.startsWith("ITEM_NOT_FOUND:")) {
               const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
               response =
