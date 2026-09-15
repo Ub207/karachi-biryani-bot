@@ -1,0 +1,7 @@
+node_modules
+.next
+app.zip
+*.zip
+.git
+.claude
+.env*
