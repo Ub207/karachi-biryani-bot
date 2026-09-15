@@ -1,45 +1,19 @@
 import Groq from "groq-sdk";
 import { ClientConfig, buildFlatMenu, buildMenuText } from "./client-config";
-import { savePendingOrder, confirmOrder } from "./orders";
+import {
+  clearOrderDraft,
+  finalizeOrderDraft,
+  getOrderDraft,
+  OrderDraft,
+  OrderItem as PersistedOrderItem,
+  saveOrderDraft,
+  getLatestOrderForUser,
+  getOrderById,
+} from "./orders";
 import { isRestaurantOpen, closedMessage } from "./hours";
 
-function getGroqClient() {
-  return new Groq({ apiKey: process.env.GROQ_API_KEY });
-}
-
-type ConversationMessage = {
-  role: "user" | "assistant";
-  content: string;
-};
-
+type ConversationMessage = { role: "user" | "assistant"; content: string };
 type ConversationEntry = { history: ConversationMessage[]; lastActiveAt: number };
-
-// Keyed by `${phoneNumberId}:${userPhone}` to isolate per-client conversations
-const conversations = new Map<string, ConversationEntry>();
-
-const CONVERSATION_EXPIRY_MS = 2 * 60 * 60 * 1000; // 2 hours
-
-// A conversation is only "genuinely active" if the last interaction was recent.
-// Beyond this grace window we treat the old session as stale/inactive even if it
-// has not hit the hard expiry, so an apparently new message starts fresh.
-const CONVERSATION_ACTIVE_MS = 30 * 60 * 1000; // 30 minutes
-
-// Deterministic, rule-based greeting detection. Kept separate from the LLM
-// intent classifier so a fresh/new-session greeting is NEVER skipped.
-// This is the SINGLE source of truth for greeting detection.
-
-// Normalize punctuation/hyphens to spaces so "assalam-o-alaikum" and
-// "salam, kya haal?" both resolve the same way.
-export function normalizeText(text: string): string {
-  if (!text) return "";
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[-–—.,!?;:'`"]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, "");
-}
-
 type IntentName =
   | "GREETING"
   | "MENU"
@@ -53,204 +27,421 @@ type IntentName =
   | "THANKS"
   | "UNKNOWN";
 
+type OrderItem = { name: string; qty: number };
 type IntentResult = { intent: IntentName; items: OrderItem[] };
 
-type DeterministicRoute =
+export type DeterministicRoute =
   | { kind: "intent"; intent: IntentResult }
   | { kind: "ambiguous"; itemName: string; matches: string[] }
-  | { kind: "unavailable"; itemName: string };
+  | { kind: "ITEM_NOT_AVAILABLE"; itemName: string }
+  | { kind: "CHEAPEST_ITEM"; item: string; price: number }
+  | { kind: "BUDGET_QUERY"; budget: number; items: { name: string; price: number }[] }
+  | { kind: "DELIVERY_AREAS" }
+  | { kind: "DELIVERY_ETA" }
+  | { kind: "ORDER_STATUS"; orderId?: string };
 
+const conversations = new Map<string, ConversationEntry>();
+const CONVERSATION_ACTIVE_MS = 30 * 60 * 1000;
 const INTENTS = new Set<IntentName>([
-  "GREETING", "MENU", "ORDER", "PRICE_QUERY", "ITEM_CHECK",
-  "CONFIRM", "CANCEL", "ADDRESS", "COMPLAINT", "THANKS", "UNKNOWN",
+  "GREETING",
+  "MENU",
+  "ORDER",
+  "PRICE_QUERY",
+  "ITEM_CHECK",
+  "CONFIRM",
+  "CANCEL",
+  "ADDRESS",
+  "COMPLAINT",
+  "THANKS",
+  "UNKNOWN",
 ]);
 
-function isMenuRequest(message: string): boolean {
+export function normalizeText(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[-–—.,!?;:'`"()]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .trim();
+}
+
+export function isGreetingMessage(message: string): boolean {
   const norm = normalizeText(message);
-  const menuPhrases = [
-    "menu", "show menu", "send menu", "full menu", "menu please",
-    "menu card", "bhejo menu", "menu dikhao", "menu bhejo",
-    "rate list", "rates", "rate", "prices", "price", "price list",
-    "list", "items", "kya items hain",
-    "kya hai menu mein", "menu kya hai", "menu list"
-  ];
   return (
-    menuPhrases.includes(norm) ||
-    norm.startsWith("menu ") ||
-    norm.endsWith(" menu") ||
-    norm.includes("menu card") ||
-    norm.includes("rate list")
+    [
+      "hi",
+      "hello",
+      "hey",
+      "salam",
+      "salaam",
+      "salam alaikum",
+      "assalam o alaikum",
+      "assalam u alaikum",
+      "assalamu alaikum",
+      "assalamualaikum",
+      "asalamualaikum",
+      "aoa",
+      "السلام عليكم",
+      "السلام علیکم",
+    ].includes(norm) || /^(salam|salaam|assalam|aoa\b)/i.test(norm)
   );
 }
 
-function isConfirmMessage(message: string): boolean {
+export function isMenuRequest(message: string): boolean {
   const norm = normalizeText(message);
-  const confirmWords = [
-    "haan", "han", "ha", "haa", "hnn", "yes", "yep", "yeah", "yup",
-    "ok", "okay", "theek hai", "thik hai", "theek", "thik",
-    "confirm", "confirmed", "ji haan", "ji", "jee", "sure", "bilkul",
-    "kar do", "bhej do", "bhejo", "done", "order confirm", "confirm order",
-    "theek hai bhej do", "haan bhej do", "haan confirm"
-  ];
-  return confirmWords.includes(norm);
-}
-
-function isCancelMessage(message: string): boolean {
-  const norm = normalizeText(message);
-  const cancelWords = [
-    "nahi", "nahin", "nhi", "na", "no", "nope",
-    "cancel", "canceled", "mat karo", "rehne do",
-    "cancel order", "cancel kar do", "order cancel"
-  ];
-  return cancelWords.includes(norm);
-}
-
-function isThanksMessage(message: string): boolean {
-  const norm = normalizeText(message);
-  const thanksWords = [
-    "shukria", "shukriya", "thanks", "thank you", "thx",
-    "jazakallah", "jazak allah", "jazakallahu khair", "dhanyawad",
-    "bohot shukriya", "bahut shukriya"
-  ];
-  return thanksWords.includes(norm);
-}
-
-function isGreetingMessage(text: string): boolean {
-  const normalized = normalizeText(text);
-  if (!normalized) return false;
-
-  // Arabic greeting substrings (kept before word-boundary regexes).
-  const arabicForms = [
-    "السلام عليكم",
-    "السلام علیکم",
-    "سلام عليكم",
-    "وعليكم السلام",
-  ];
-  if (arabicForms.some((g) => normalized.includes(g))) return true;
-
-  // Roman-Urdu / hybrid mappings normalized for "s", "a", "la", "ikum".
-  const compact = normalized.replace(/\s+/g, "");
-  const salamCompact = /^sala+m(alaikum|al[a]?ikum)?$/.test(compact);
-  const assalamCompact = /^s?alamual?al[i]?kum$|^ass?alamo?al[a]?ikum$/.test(compact);
-
-  if (salamCompact || assalamCompact) return true;
-
-  // Full-word / phrase forms mapped after normalization.
-  const phraseForms = [
-    "salam",
-    "salaam",
-    "salam alaikum",
-    "salamalaikum",
-    "asalamualaikum",
-    "assalamualaikum",
-    "assalamu alaikum",
-    "assalamo alaikum",
-    "assalam alaikum",
-    "assalam o alaikum",
-    "salaam alaikum",
-    "slm",
-    "hi",
-    "hello",
-    "hey",
-    "hola",
-  ];
-  if (phraseForms.includes(normalized)) return true;
-
-  // Tolerate greetings with extra trailing words, e.g. "salam kya haal".
-  if (/^salam( |alaikum|ualikum)/.test(normalized)) return true;
-
-  return false;
-}
-
-// Reset keywords — "reset", "restart", "start over", "shuru se", etc.
-const RESET_PATTERNS: RegExp[] = [
-  /\b(reset|restart|fresh\s*start)\b/i,
-  /\b(start\s*over|begin\s*again)\b/i,
-  /\b(shuru\s*se|shuru\s*kar|naya\s*shuru|dobara\s*shuru|waps\s*shuru)\b/i,
-];
-
-function isResetMessage(text: string): boolean {
-  const normalized = normalizeText(text);
-  if (!normalized) return false;
-  return RESET_PATTERNS.some((re) => re.test(normalized));
-}
-
-function buildGreetingResponse(config: ClientConfig): string {
   return (
-    config.responses?.greeting ??
-    `*Wa alaikum assalam!* 🌙 [GREETING-V2]\n\n` +
-      `${config.business.name} mein khush amdeed! 🍛\n\n` +
-      `Main aap ki madad kar sakta hoon menu, biryani, prices aur order ke hawale se.\n\n` +
-      `📋 "menu" - menu dekhne ke liye\n` +
-      `🛒 "1 chicken biryani" - order karne ke liye\n` +
-      `💬 Item ka naam - rate puchne ke liye`
+    [
+      "menu",
+      "show menu",
+      "menu please",
+      "rates",
+      "rate list",
+      "prices",
+      "price list",
+      "list",
+      "items",
+      "kya items hain",
+      "kya hai menu mein",
+      "menu kya hai",
+      "menu card",
+      "menu dikhao",
+      "menu bhejo",
+    ].includes(norm) || norm.includes("menu card")
   );
 }
 
-function buildIntentPrompt(flatMenu: Record<string, number>): string {
-  return `You are an intent classifier for a Pakistani restaurant WhatsApp bot.
-
-OUR MENU ITEMS:
-${Object.keys(flatMenu).join(", ")}
-
-Return ONLY valid JSON. No explanation. No markdown.
-
-INTENTS:
-- GREETING: salam, hi, hello, assalam, salaam, asalamualaikum, etc.
-- MENU: user asks for menu, list, what do you have, kya hai, items, etc.
-- ORDER: user wants to order specific items
-- PRICE_QUERY: user asks price of specific item
-- ITEM_CHECK: user asks "do you have X?" (pizza, dahi, etc.)
-- CONFIRM: yes, haan, confirm, ok, theek hai
-- CANCEL: no, nahi, cancel, mat karo
-- ADDRESS: user provides delivery address
-- COMPLAINT: discount request, price negotiation
-- THANKS: thank you, shukria, thanks
-- UNKNOWN: anything else
-
-EXAMPLES:
-
-User: "salam"
-{"intent": "GREETING", "items": []}
-
-User: "Assalamu alaikum"
-{"intent": "GREETING", "items": []}
-
-User: "menu"
-{"intent": "MENU", "items": []}
-
-User: "sindhi biryani"
-{"intent": "PRICE_QUERY", "items": [{"name": "Sindhi Biryani Single", "qty": 1}]}
-
-User: "1 chicken biryani family pack"
-{"intent": "ORDER", "items": [{"name": "Chicken Biryani Family Pack", "qty": 1}]}
-
-User: "pizza?"
-{"intent": "ITEM_CHECK", "items": [{"name": "pizza", "qty": 1}]}
-
-User: "discount do"
-{"intent": "COMPLAINT", "items": []}
-
-User: "haan"
-{"intent": "CONFIRM", "items": []}
-
-User: "shukria"
-{"intent": "THANKS", "items": []}`;
+export function isConfirmMessage(message: string): boolean {
+  return [
+    "haan",
+    "han",
+    "ha",
+    "yes",
+    "yep",
+    "ok",
+    "okay",
+    "confirm",
+    "confirmed",
+    "ji",
+    "jee",
+    "bilkul",
+    "theek hai",
+    "thik hai",
+  ].includes(normalizeText(message));
 }
 
-function extractJSON(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {}
+export function isCancelMessage(message: string): boolean {
+  return [
+    "nahi",
+    "nahin",
+    "nhi",
+    "no",
+    "cancel",
+    "cancel order",
+    "order cancel",
+    "mat karo",
+    "rehne do",
+    "nahi chahiye",
+    "cancel kardo",
+  ].includes(normalizeText(message));
+}
 
-  const match = text.match(/\{[\s\S]*\}/);
-  if (match) {
-    try {
-      return JSON.parse(match[0]);
-    } catch {}
+export function isThanksMessage(message: string): boolean {
+  return [
+    "shukria",
+    "shukriya",
+    "thanks",
+    "thank you",
+    "thx",
+    "jazakallah",
+  ].includes(normalizeText(message));
+}
+
+export function isResetMessage(message: string): boolean {
+  return /\b(reset|restart|start\s*over|shuru\s*se)\b/i.test(normalizeText(message));
+}
+
+export function isDeliveryAreaQuery(message: string): boolean {
+  const norm = normalizeText(message);
+  return (
+    (/\b(delivery|deliver)\b/i.test(norm) &&
+      /\b(karachi|kahan|areas|area|ilaqe|ilaqa|konsay|konse|places|locations|hoti|karte|available)\b/i.test(
+        norm
+      )) ||
+    (/^delivery\b/i.test(norm) && norm.includes("karachi"))
+  );
+}
+
+export function isDeliveryEtaQuery(message: string): boolean {
+  const norm = normalizeText(message);
+  return /\b(kitni dair|kitna time|kitni der|der lagegi|dair lagegi|delivery time|kab tak|eta|time kitna|time lagega)\b/i.test(
+    norm
+  );
+}
+
+export function parseOrderStatusQuery(message: string): { isStatus: boolean; orderId?: string } {
+  const norm = normalizeText(message);
+  const idMatch = message.match(/\b(ORD-[A-Z0-9]+)\b/i);
+  if (idMatch) return { isStatus: true, orderId: idMatch[1].toUpperCase() };
+  if (
+    /\b(mera order|order status|order kahan|order kab|track order|kahan hai order|kahan pohncha|status kya hai)\b/i.test(
+      norm
+    )
+  ) {
+    return { isStatus: true };
+  }
+  return { isStatus: false };
+}
+
+export function parseBudgetQuery(message: string): number | null {
+  const norm = normalizeText(message);
+  const underMatch = norm.match(/\b(?:under|below|less than)\s+(\d+)\b/i);
+  if (underMatch) return Number(underMatch[1]);
+
+  const numFirstMatch = norm.match(/\b(\d+)\s*(?:se kam|tak|ke under|ke andar|mein kya|budget)\b/i);
+  if (numFirstMatch) return Number(numFirstMatch[1]);
+
+  return null;
+}
+
+export function findMenuItem(searchName: string, menu: Record<string, number>): string | null {
+  const search = normalizeText(searchName);
+  if (!search) return null;
+  const keys = Object.keys(menu);
+  const words = search.split(" ").filter((word) => word.length > 2);
+  return (
+    keys.find((key) => normalizeText(key) === search) ??
+    keys.find((key) => normalizeText(key).includes(search) || search.includes(normalizeText(key))) ??
+    (words.length ? keys.find((key) => words.every((word) => normalizeText(key).includes(word))) : null) ??
+    null
+  );
+}
+
+export function findAllMatches(searchName: string, menu: Record<string, number>): string[] {
+  const search = normalizeText(searchName);
+  if (!search) return [];
+  const words = search.split(" ").filter(Boolean);
+  return Object.keys(menu).filter((key) => {
+    const item = normalizeText(key);
+    if (item.includes(search)) return true;
+    if (words.length > 1) return words.every((word) => item.includes(word));
+    return words.some((word) => word.length > 2 && item.includes(word));
+  });
+}
+
+export function parseAvailabilityQuery(message: string): string | null {
+  const norm = normalizeText(message);
+  if (
+    isGreetingMessage(message) ||
+    isMenuRequest(message) ||
+    isConfirmMessage(message) ||
+    isCancelMessage(message) ||
+    isThanksMessage(message) ||
+    isResetMessage(message) ||
+    isDeliveryAreaQuery(message) ||
+    isDeliveryEtaQuery(message) ||
+    parseOrderStatusQuery(message).isStatus ||
+    parseBudgetQuery(message) !== null ||
+    /\b(sab se sasti|sab se sasta|cheapest|sasti cheez|sasta item|sab se kam rate)\b/i.test(norm)
+  ) {
+    return null;
   }
 
-  return { intent: "UNKNOWN", items: [] };
+  // General "what is" question (e.g. "cricket score kya hai?", "capital kya hai?")
+  // should not be treated as item availability unless it mentions food availability indicators
+  if (
+    /\bkya\s+(hai|he|h)\b/i.test(norm) &&
+    !/\b(available|milta|milti|maujood|paas|to nahi hai|nahi hai|nahin hai|nhi hai)\b/i.test(norm)
+  ) {
+    return null;
+  }
+
+  const hasIndicator =
+    /\b(h|hai|he|available|milta|milti|maujood)\b/i.test(norm) ||
+    /^(do you have|kya aap ke paas|aap ke paas)\b/i.test(norm);
+  if (!hasIndicator) return null;
+
+  let cleaned = norm
+    .replace(/^(do you have|kya aap ke paas|aap ke paas|kya)\s+/i, "")
+    .replace(/\b(to nahi hai|nahi hai|nahin hai|nhi hai|nahi h|nahin h|nhi h|nahi he|nahi|nahin|nhi)\b/gi, "")
+    .replace(/\b(available|milta|milti|maujood|hai|he|h|kya)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  cleaned = cleaned.replace(/\b(hai|ha|han|ji)\b$/i, "").trim();
+  return cleaned && cleaned.length <= 60 ? cleaned : null;
+}
+
+export function parsePriceQuery(message: string): string | null {
+  const norm = normalizeText(message);
+  if (/\b(rate|price|qeemat|kitne ka|kitne ki|cost)\b/i.test(norm)) {
+    const item = norm
+      .replace(
+        /\b(kya rate hai|rate kya hai|price kya hai|rate|price|qeemat|kitne ka hai|kitne ki hai|kitne ka|kitne ki|cost|kya hai|batao|bataen)\b/gi,
+        ""
+      )
+      .replace(/\b(ka|ki|ke|hai|h|he)\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return item || null;
+  }
+  return null;
+}
+
+function cleanOrderPart(part: string): string {
+  return part
+    .replace(/^(?:mujhe|humein|humay|bhai|yaar)\s+/i, "")
+    .replace(/\s+(?:chahiye|bhej\s*(?:do|dein)|pack\s*(?:kardo|kar\s*do|karein)|kardo|lao|dein|chahye)$/i, "")
+    .trim();
+}
+
+export function parseOrder(message: string, menu: Record<string, number>): OrderItem[] | null {
+  if (
+    isGreetingMessage(message) ||
+    isMenuRequest(message) ||
+    isConfirmMessage(message) ||
+    isCancelMessage(message) ||
+    isThanksMessage(message) ||
+    isResetMessage(message) ||
+    isDeliveryAreaQuery(message) ||
+    isDeliveryEtaQuery(message) ||
+    parseOrderStatusQuery(message).isStatus ||
+    parseBudgetQuery(message) !== null ||
+    parseAvailabilityQuery(message) !== null ||
+    /\b(sab se sasti|cheapest)\b/i.test(normalizeText(message))
+  ) {
+    return null;
+  }
+
+  const norm = normalizeText(message);
+  const parts = message.split(/\s*(?:,|\band\b|\baur\b|\+|\n)\s*/i).filter(Boolean);
+  const rawItems: { name: string; qty: number; hasExplicitQtyOrIntent: boolean }[] = [];
+
+  for (const part of parts) {
+    const cleaned = cleanOrderPart(normalizeText(part));
+    if (!cleaned) continue;
+
+    // Pattern 1: Leading quantity: "1 chicken biryani", "2x naan", "5 plate biryani"
+    const leadMatch = cleaned.match(/^(\d+)\s*(?:x\s*|plate\s*|plates\s*)?(.+)$/i);
+    if (leadMatch && /^\d+$/.test(leadMatch[1])) {
+      const qty = Number(leadMatch[1]);
+      const name = leadMatch[2].trim();
+      if (qty >= 1 && qty <= 99 && name.length > 0) {
+        rawItems.push({ name, qty, hasExplicitQtyOrIntent: true });
+        continue;
+      }
+    }
+
+    // Pattern 2: Trailing quantity: "chicken biryani 2", "naan 3 plate"
+    const trailMatch = cleaned.match(/^(.+?)\s*(\d+)(?:\s*(?:plate|plates|x))?$/i);
+    if (trailMatch && /^\d+$/.test(trailMatch[2])) {
+      const name = trailMatch[1].trim();
+      const qty = Number(trailMatch[2]);
+      if (qty >= 1 && qty <= 99 && name.length > 0) {
+        rawItems.push({ name, qty, hasExplicitQtyOrIntent: true });
+        continue;
+      }
+    }
+
+    // Pattern 3: No quantity given. Check if cleaned matches a menu item or ordering keywords exist
+    const hasOrderingWord = /\b(chahiye|order|bhej|pack|lao)\b/i.test(norm);
+    const matchesMenu = findAllMatches(cleaned, menu).length > 0 || findMenuItem(cleaned, menu) !== null;
+    if (matchesMenu || hasOrderingWord) {
+      rawItems.push({ name: cleaned, qty: 1, hasExplicitQtyOrIntent: true });
+    }
+  }
+
+  if (!rawItems.length || !rawItems.some((i) => i.hasExplicitQtyOrIntent)) {
+    return null;
+  }
+
+  return rawItems.map((i) => ({ name: i.name, qty: i.qty }));
+}
+
+export function routeDeterministically(message: string, menu: Record<string, number>): DeterministicRoute | null {
+  if (isMenuRequest(message)) return { kind: "intent", intent: { intent: "MENU", items: [] } };
+  if (isConfirmMessage(message)) return { kind: "intent", intent: { intent: "CONFIRM", items: [] } };
+  if (isCancelMessage(message)) return { kind: "intent", intent: { intent: "CANCEL", items: [] } };
+  if (isThanksMessage(message)) return { kind: "intent", intent: { intent: "THANKS", items: [] } };
+
+  // Delivery ETA
+  if (isDeliveryEtaQuery(message)) {
+    return { kind: "DELIVERY_ETA" };
+  }
+
+  // Delivery availability/areas
+  if (isDeliveryAreaQuery(message)) {
+    return { kind: "DELIVERY_AREAS" };
+  }
+
+  // Order status
+  const orderStatus = parseOrderStatusQuery(message);
+  if (orderStatus.isStatus) {
+    return { kind: "ORDER_STATUS", orderId: orderStatus.orderId };
+  }
+
+  // Cheapest item query
+  const norm = normalizeText(message);
+  if (/\b(sab se sasti|sab se sasta|cheapest|sasti cheez|sasta item|sab se kam rate|sab se kam qeemat)\b/i.test(norm)) {
+    const entries = Object.entries(menu);
+    if (entries.length > 0) {
+      const minPrice = Math.min(...entries.map(([, p]) => p));
+      const cheapest = entries.find(([, p]) => p === minPrice);
+      if (cheapest) {
+        return { kind: "CHEAPEST_ITEM", item: cheapest[0], price: cheapest[1] };
+      }
+    }
+  }
+
+  // Budget filtering
+  const budget = parseBudgetQuery(message);
+  if (budget !== null) {
+    const affordable = Object.entries(menu)
+      .filter(([, price]) => price <= budget)
+      .sort((a, b) => a[1] - b[1])
+      .map(([name, price]) => ({ name, price }));
+    return { kind: "BUDGET_QUERY", budget, items: affordable };
+  }
+
+  // Product availability query: "pizza h?", "chicken biryani nahi hai?", etc.
+  const availability = parseAvailabilityQuery(message);
+  if (availability) {
+    const matches = findAllMatches(availability, menu);
+    const exact = matches.find((m) => normalizeText(m) === normalizeText(availability));
+    const single = matches.find((m) => normalizeText(m).replace(/\bsingle\b/, "").trim() === normalizeText(availability));
+    const found = exact ?? single ?? (matches.length === 1 ? matches[0] : findMenuItem(availability, menu));
+    if (found) {
+      return { kind: "intent", intent: { intent: "ITEM_CHECK", items: [{ name: found, qty: 1 }] } };
+    }
+    if (matches.length > 1) {
+      return { kind: "ambiguous", itemName: availability, matches };
+    }
+    return { kind: "ITEM_NOT_AVAILABLE", itemName: availability };
+  }
+
+  // Specific price query: "chicken biryani ka rate kya hai"
+  const priceItem = parsePriceQuery(message);
+  if (priceItem) {
+    const match = findMenuItem(priceItem, menu);
+    if (match) {
+      return { kind: "intent", intent: { intent: "PRICE_QUERY", items: [{ name: match, qty: 1 }] } };
+    }
+  }
+
+  // Multi-item / standard order parsing
+  const items = parseOrder(message, menu);
+  if (!items) return null;
+  const resolved: OrderItem[] = [];
+  for (const item of items) {
+    const matches = findAllMatches(item.name, menu);
+    const exact = matches.find((m) => normalizeText(m) === normalizeText(item.name));
+    const single = matches.find((m) => normalizeText(m).replace(/\bsingle\b/, "").trim() === normalizeText(item.name));
+    if (matches.length > 1 && !exact && !single) return { kind: "ambiguous", itemName: item.name, matches };
+    const match = exact ?? single ?? findMenuItem(item.name, menu);
+    if (!match) return { kind: "ITEM_NOT_AVAILABLE", itemName: item.name };
+    resolved.push({ name: match, qty: item.qty });
+  }
+  return { kind: "intent", intent: { intent: "ORDER", items: resolved } };
 }
 
 export function normalizeIntent(value: unknown): IntentName {
@@ -258,290 +449,159 @@ export function normalizeIntent(value: unknown): IntentName {
   return INTENTS.has(intent as IntentName) ? (intent as IntentName) : "UNKNOWN";
 }
 
+function extractJSON(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const match = text.match(/\{[\s\S]*\}/);
+    try {
+      return match ? JSON.parse(match[0]) : {};
+    } catch {
+      return {};
+    }
+  }
+}
+
 export function parseIntentResponse(text: string): IntentResult {
   const parsed = extractJSON(text);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { intent: "UNKNOWN", items: [] };
-  }
-
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { intent: "UNKNOWN", items: [] };
   const record = parsed as Record<string, unknown>;
   const items = Array.isArray(record.items)
-    ? record.items.flatMap((item: unknown) => {
-        if (!item || typeof item !== "object" || typeof (item as { name?: unknown }).name !== "string") {
-          return [];
-        }
-        const name = (item as { name: string }).name.trim();
-        const quantity = Number((item as { qty?: unknown }).qty);
-        if (!name || !Number.isSafeInteger(quantity) || quantity <= 0) return [];
-        return [{ name, qty: quantity }];
+    ? record.items.flatMap((item) => {
+        if (!item || typeof item !== "object" || typeof (item as { name?: unknown }).name !== "string") return [];
+        const candidate = item as { name: string; qty?: unknown };
+        const qty = Number(candidate.qty);
+        return candidate.name.trim() && Number.isSafeInteger(qty) && qty > 0
+          ? [{ name: candidate.name.trim(), qty }]
+          : [];
       })
     : [];
-
   return { intent: normalizeIntent(record.intent), items };
 }
 
-function parseDeterministicOrder(
-  message: string,
-  flatMenu?: Record<string, number>
-): OrderItem[] | null {
-  const normalized = normalizeText(message);
-  if (!normalized) return null;
-
-  if (
-    isGreetingMessage(message) ||
-    isMenuRequest(message) ||
-    isConfirmMessage(message) ||
-    isCancelMessage(message) ||
-    isThanksMessage(message) ||
-    isResetMessage(message)
-  ) {
-    return null;
-  }
-
-  const segments = message.split(/\s*(?:,|\band\b|\baur\b|\+|\&|\n)\s*/i).filter((s) => s.trim().length > 0);
-  const items: OrderItem[] = [];
-
-  for (const segment of segments) {
-    const trimmed = segment.trim();
-    if (!trimmed) continue;
-
-    const normalizedSegment = normalizeText(trimmed);
-    const leadingMatch = normalizedSegment.match(/^(\d+)\s*(?:x\s*)?(.+)$/);
-    const trailingMatch = normalizedSegment.match(/^(.+?)\s*(?:x\s*)?(\d+)$/);
-
-    let qty = 1;
-    let name = "";
-
-    if (leadingMatch) {
-      qty = Number(leadingMatch[1]);
-      name = leadingMatch[2].trim();
-    } else if (trailingMatch) {
-      name = trailingMatch[1].trim();
-      qty = Number(trailingMatch[2]);
-    } else {
-      name = trimmed;
-      qty = 1;
-    }
-
-    if (!Number.isSafeInteger(qty) || qty < 1 || qty > 99 || !name) {
-      return null;
-    }
-
-    if (!leadingMatch && !trailingMatch) {
-      if (flatMenu) {
-        const matches = findAllMatches(name, flatMenu);
-        if (matches.length === 0) {
-          return null;
-        }
-      } else {
-        return null;
-      }
-    }
-
-    items.push({ name, qty });
-  }
-
-  return items.length > 0 ? items : null;
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+function getGroqClient() {
+  return new Groq({ apiKey: process.env.GROQ_API_KEY });
 }
 
-export function routeDeterministically(
-  message: string,
-  flatMenu: Record<string, number>,
-  lastAssistantMessage?: string
-): DeterministicRoute | null {
-  if (isMenuRequest(message)) {
-    return { kind: "intent", intent: { intent: "MENU", items: [] } };
-  }
-
-  if (isConfirmMessage(message)) {
-    return { kind: "intent", intent: { intent: "CONFIRM", items: [] } };
-  }
-
-  if (isCancelMessage(message)) {
-    return { kind: "intent", intent: { intent: "CANCEL", items: [] } };
-  }
-
-  if (isThanksMessage(message)) {
-    return { kind: "intent", intent: { intent: "THANKS", items: [] } };
-  }
-
-  // If the bot previously asked for the delivery address
-  if (
-    lastAssistantMessage &&
-    (lastAssistantMessage.includes("delivery address") ||
-     lastAssistantMessage.includes("address kya hai") ||
-     lastAssistantMessage.includes("address bhejein"))
-  ) {
-    return { kind: "intent", intent: { intent: "ADDRESS", items: [] } };
-  }
-
-  const orderItems = parseDeterministicOrder(message, flatMenu);
-  if (!orderItems) return null;
-
-  const resolvedItems: OrderItem[] = [];
-  for (const item of orderItems) {
-    const matches = findAllMatches(item.name, flatMenu);
-    const normalizedItem = normalizeText(item.name);
-    const exact = matches.find((match) => normalizeText(match) === normalizedItem);
-    const singleServing = matches.find(
-      (match) => normalizeText(match).replace(/\bsingle\b/, "").trim() === normalizedItem
-    );
-    if (matches.length > 1 && !exact && !singleServing) {
-      return { kind: "ambiguous", itemName: item.name, matches };
-    }
-    const resolved = exact ?? singleServing ?? findMenuItem(item.name, flatMenu);
-    if (!resolved) {
-      return { kind: "unavailable", itemName: item.name };
-    }
-    resolvedItems.push({ name: resolved, qty: item.qty });
-  }
-
-  return { kind: "intent", intent: { intent: "ORDER", items: resolvedItems } };
-}
-
+// Returns null when the classifier is unavailable or fails — callers must degrade
+// gracefully. Internal failures are logged here, never surfaced to customers.
 async function classifyIntent(
   message: string,
   history: ConversationMessage[],
-  flatMenu: Record<string, number>
-) {
-  const recentContext = history
+  menu: Record<string, number>
+): Promise<IntentResult | null> {
+  if (!process.env.GROQ_API_KEY) {
+    console.warn("[agent] classifier_unavailable", { reason: "missing_api_key" });
+    return null;
+  }
+  const prompt = `You classify Pakistani restaurant messages. Menu: ${Object.keys(menu).join(", ")}. Return only JSON: {"intent":"GREETING|MENU|ORDER|PRICE_QUERY|ITEM_CHECK|CONFIRM|CANCEL|ADDRESS|COMPLAINT|THANKS|UNKNOWN","items":[{"name":"string","qty":1}]}.`;
+  const context = history
     .slice(-4)
-    .map((h) => `${h.role}: ${h.content}`)
+    .map((entry) => `${entry.role}: ${entry.content}`)
     .join("\n");
-
-  const userInput = recentContext
-    ? `Conversation:\n${recentContext}\n\nNew message: ${message}`
-    : `User message: ${message}`;
-
   try {
-    console.log("🤖 [AI CALL] Invoking Groq LLM (llama-3.3-70b-versatile)...", { message });
-    const groq = getGroqClient();
-    const res = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+    const response = await getGroqClient().chat.completions.create({
+      model: GROQ_MODEL,
       temperature: 0.1,
-      max_tokens: 200,
+      max_tokens: 300,
       messages: [
-        { role: "system", content: buildIntentPrompt(flatMenu) },
-        { role: "user", content: userInput },
+        { role: "system", content: prompt },
+        { role: "user", content: context ? `${context}\nuser: ${message}` : message },
       ],
     });
-
-    const parsed = parseIntentResponse(res.choices[0]?.message?.content || "{}");
-    console.log("🤖 [AI RESPONSE] Groq intent result:", parsed);
-    return parsed;
-  } catch (err) {
-    console.error("❌ [AI ERROR] Intent classification failed:", err);
-    throw err;
+    return parseIntentResponse(response.choices[0]?.message?.content ?? "{}");
+  } catch (error) {
+    console.error("[agent] classifier_unavailable", { error });
+    return null;
   }
 }
 
-function findMenuItem(
-  searchName: string,
-  flatMenu: Record<string, number>
-): string | null {
-  if (!searchName) return null;
-  const search = searchName.toLowerCase().trim();
-
-  const exact = Object.keys(flatMenu).find((k) => k.toLowerCase() === search);
-  if (exact) return exact;
-
-  const contains = Object.keys(flatMenu).find(
-    (k) =>
-      k.toLowerCase().includes(search) || search.includes(k.toLowerCase())
-  );
-  if (contains) return contains;
-
-  const searchWords = search.split(/\s+/);
-  return (
-    Object.keys(flatMenu).find((k) => {
-      const itemWords = k.toLowerCase().split(/\s+/);
-      return searchWords.some(
-        (sw) => sw.length > 2 && itemWords.some((iw) => iw.includes(sw) || sw.includes(iw))
-      );
-    }) || null
-  );
+function safeItemName(value: string): string {
+  return value.replace(/[*_~`\\]/g, "").trim().slice(0, 60) || "yeh item";
 }
 
-function findAllMatches(
-  searchName: string,
-  flatMenu: Record<string, number>
-): string[] {
-  if (!searchName) return [];
-  const search = searchName.toLowerCase().trim();
-  const searchWords = search.split(/\s+/).filter((w) => w.length > 0);
-  return Object.keys(flatMenu).filter((k) => {
-    const itemLower = k.toLowerCase();
-    if (itemLower.includes(search)) return true;
-    if (searchWords.length > 1) {
-      return searchWords.every((w) => itemLower.includes(w));
-    }
-    return searchWords.some((w) => w.length > 2 && itemLower.includes(w));
-  });
+// Customer-friendly "not on the menu" reply — lists what we DO have.
+function formatItemNotAvailable(itemName: string, menu: Record<string, number>): string {
+  const names = Array.from(new Set(Object.keys(menu).map((name) => name.replace(/\s+single$/i, ""))));
+  return `Maaf kijiye, ${safeItemName(itemName)} hamare menu mein available nahi hai.\n\nHamare paas:\n${names.map((name) => `- ${name}`).join("\n")}\n\nmaujood hain.\n\nAap in mein se kya order karna chahenge?`;
 }
 
-type OrderItem = { name: string; qty: number };
-type MatchedItem = { name: string; qty: number; price: number; lineTotal: number };
-
-function calculateOrder(items: OrderItem[], flatMenu: Record<string, number>) {
-  const matched: MatchedItem[] = [];
-  let subtotal = 0;
-
+function toPersistedItems(
+  items: OrderItem[],
+  menu: Record<string, number>
+): PersistedOrderItem[] | { kind: "ITEM_NOT_AVAILABLE"; itemName: string } {
+  const matched: PersistedOrderItem[] = [];
   for (const item of items) {
-    const key = findMenuItem(item.name, flatMenu);
-    if (!key) {
-      throw new Error(`ITEM_NOT_FOUND:${item.name}`);
+    const menuItem = findMenuItem(item.name, menu);
+    if (!menuItem) return { kind: "ITEM_NOT_AVAILABLE", itemName: item.name };
+    if (!Number.isSafeInteger(item.qty) || item.qty < 1 || item.qty > 99) {
+      return { kind: "ITEM_NOT_AVAILABLE", itemName: item.name };
     }
-
-    const qty = item.qty || 1;
-    const price = flatMenu[key];
-    const lineTotal = price * qty;
-
-    matched.push({ name: key, qty, price, lineTotal });
-    subtotal += lineTotal;
+    const price = menu[menuItem];
+    matched.push({ name: menuItem, qty: item.qty, price, lineTotal: price * item.qty });
   }
-
-  return { subtotal, matched };
+  return matched;
 }
 
-function formatOrderConfirmation(
-  matched: MatchedItem[],
-  subtotal: number,
-  config: ClientConfig
-) {
-  const { currency, deliveryFee, minimumOrder } = config.business;
-  const list = matched
-    .map((i) => `• ${i.name} x${i.qty} = ${currency} ${i.lineTotal}`)
-    .join("\n");
+function isQuantity(message: string): number | null {
+  const normalized = normalizeText(message);
+  if (!/^\d+$/.test(normalized)) return null;
+  const quantity = Number(normalized);
+  return Number.isSafeInteger(quantity) && quantity >= 1 && quantity <= 99 ? quantity : null;
+}
 
-  if (subtotal < minimumOrder) {
-    return (
-      `🧾 *Aap ka Order:*\n${list}\n\n` +
-      `Subtotal: ${currency} ${subtotal}\n\n` +
-      `⚠️ Minimum order ${currency} ${minimumOrder} hai.\n` +
-      `${currency} ${minimumOrder - subtotal} aur add karein.`
-    );
-  }
+function formatAddressPrompt(config: ClientConfig): string {
+  return `Delivery address batayein.\n\nHum yahan deliver karte hain:\n${config.business.deliveryAreas.map((area) => `• ${area}`).join("\n")}`;
+}
 
-  const total = subtotal + deliveryFee;
+function makeDraft(
+  phase: OrderDraft["phase"],
+  items: PersistedOrderItem[],
+  deliveryFee: number,
+  address?: string
+): OrderDraft {
+  const now = new Date().toISOString();
+  const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0);
+  return {
+    phase,
+    items,
+    subtotal,
+    deliveryFee,
+    total: subtotal + deliveryFee,
+    address,
+    confirmation: phase === "AWAITING_CONFIRMATION" ? "PENDING" : "NOT_ASKED",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function formatDraftSummary(draft: OrderDraft, currency: string): string {
+  const items = draft.items.map((item) => `${item.qty} ${item.name}`).join("\n");
+  return `Aapka order:\n\n${items}\n\nTotal: ${currency} ${draft.subtotal}\nDelivery: ${currency} ${draft.deliveryFee}\n━━━━━━━━━━━━━\nGrand Total: ${currency} ${draft.total}\n\nAddress: ${draft.address}\n\nConfirm karein?\n(Yes / No)`;
+}
+
+function promptForQuantity(item: PersistedOrderItem): string {
+  return `Kitni quantity chahiye?\n\n(${item.name} — ${item.price} per unit)`;
+}
+
+function minimumOrderMessage(shortfall: number, minimum: number, currency: string): string {
+  return `⚠️ Minimum order ${currency} ${minimum} hai.\n\n${currency} ${shortfall} aur add karein, ya menu dekhein: "menu" likhein.`;
+}
+
+function buildGreetingResponse(config: ClientConfig): string {
   return (
-    `🧾 *Aap ka Order:*\n${list}\n\n` +
-    `Subtotal: ${currency} ${subtotal}\n` +
-    `Delivery: ${currency} ${deliveryFee}\n` +
-    `━━━━━━━━━━━━━\n` +
-    `*Total: ${currency} ${total}*\n\n` +
-    `Confirm karne ke liye "haan" likhein.\n` +
-    `Cancel karne ke liye "nahi" likhein.`
+    config.responses?.greeting ??
+    `${config.business.name} mein khush amdeed! 🍛\n\n"menu" likh kar menu dekhein, ya "1 chicken biryani" likh kar order karein.`
   );
 }
 
-function formatPriceInfo(
-  matched: { name: string; price: number }[],
-  currency: string
-) {
-  return (
-    matched.map((i) => `*${i.name}*: ${currency} ${i.price}`).join("\n") +
-    `\n\nOrder karna ho to "1 ${matched[0].name}" likhein.`
-  );
+function draftReprompt(draft: OrderDraft, config: ClientConfig): string {
+  if (draft.phase === "AWAITING_QUANTITY")
+    return `${promptForQuantity(draft.items[0])}\n\nOrder badalne ke liye "cancel" likhein.`;
+  if (draft.phase === "AWAITING_ADDRESS")
+    return `${formatAddressPrompt(config)}\n\nOrder cancel karne ke liye "cancel" likhein.`;
+  return "Confirm karne ke liye Yes, cancel karne ke liye No likhein.";
 }
 
 export async function getAIResponse(
@@ -550,292 +610,243 @@ export async function getAIResponse(
   userMessage: string,
   config: ClientConfig
 ): Promise<string> {
-  const flatMenu = buildFlatMenu(config);
+  const menu = buildFlatMenu(config);
   const menuText = buildMenuText(config);
-  const { business } = config;
-  const currency = business.currency;
+  const currency = config.business.currency;
   const convKey = `${phoneNumberId}:${userPhone}`;
-
-  const now = Date.now();
   const existing = conversations.get(convKey);
-  let isNewSession = true;
-  let history: ConversationMessage[] = [];
-
-  // Determine whether this is a genuinely active session.
-  // A session is only reused if it exists AND the last interaction is both
-  // within the hard expiry AND within the active grace window.
-  if (existing) {
-    const withinExpiry = now - existing.lastActiveAt < CONVERSATION_EXPIRY_MS;
-    const isActive = now - existing.lastActiveAt < CONVERSATION_ACTIVE_MS;
-    if (withinExpiry && isActive) {
-      history = existing.history;
-      isNewSession = false;
-    } else {
-      console.log(
-        `[agent] Session for ${convKey} is stale/inactive (lastActive ${existing.lastActiveAt}), starting fresh`
-      );
-    }
-  }
-
-  console.log(
-    `[agent] Entry | user=${userPhone} | session=${convKey} | isNewSession=${isNewSession} | prevHistoryLen=${history.length}`
-  );
-
+  let history: ConversationMessage[] =
+    existing && Date.now() - existing.lastActiveAt < CONVERSATION_ACTIVE_MS ? existing.history : [];
   const finish = (response: string) => {
-    history.push({ role: "user", content: userMessage });
-    history.push({ role: "assistant", content: response });
-    history = history.slice(-20);
+    const next: ConversationMessage[] = [
+      ...history,
+      { role: "user", content: userMessage },
+      { role: "assistant", content: response },
+    ];
+    history = next.slice(-20);
     conversations.set(convKey, { history, lastActiveAt: Date.now() });
-    console.log(
-      `[agent] State | user=${userPhone} | session=${convKey} | nextHistoryLen=${history.length}`
-    );
     return response;
   };
 
-  // Reset support: clear any existing state before proceeding.
-  if (isResetMessage(userMessage)) {
-    conversations.delete(convKey);
-    history = [];
-    isNewSession = true;
-    const resetMsg =
-      `🔄 Conversation reset ho gaya hai.\n\n` + buildGreetingResponse(config);
-    console.log(`[agent] RESET | user=${userPhone} | session=${convKey} | nextState='fresh-greeting'`);
-    return finish(resetMsg);
-  }
-
-  // Greeting detection happens BEFORE normal intent routing so a new/fresh
-  // session always starts from step 1 (greeting), never step 2.
-  if (isGreetingMessage(userMessage)) {
-    const greetingMsg = buildGreetingResponse(config);
-    console.log(
-      `[agent] GREETING | user=${userPhone} | session=${convKey} | isNewSession=${isNewSession} | nextState='greeting'`
-    );
-    return finish(greetingMsg);
-  }
-
-  const lastAssistantMsg = history.filter((h) => h.role === "assistant").slice(-1)[0]?.content;
-  const deterministicRoute = routeDeterministically(userMessage, flatMenu, lastAssistantMsg);
-  if (deterministicRoute?.kind === "ambiguous") {
-    return finish(
-      `🤔 "${deterministicRoute.itemName}" mein kaunsa chahiye?\n\n` +
-        deterministicRoute.matches
-          .map((item, index) => `${index + 1}. ${item} - ${currency} ${flatMenu[item]}`)
-          .join("\n") +
-        `\n\nFull naam likh kar bhejein.`
-    );
-  }
-  if (deterministicRoute?.kind === "unavailable") {
-    return finish(
-      `❌ Maaf kijiye, *${deterministicRoute.itemName}* available nahi hai.\n\n${menuText}`
-    );
-  }
-
-  let response = "";
-
   try {
-    const intent = deterministicRoute?.intent ?? await classifyIntent(userMessage, history, flatMenu);
-    console.log("🎯 [DETECTED INTENT]", {
-      user: userPhone,
-      session: convKey,
-      intent: intent.intent,
-      deterministic: Boolean(deterministicRoute),
-      items: intent.items,
-    });
+    if (isResetMessage(userMessage)) {
+      conversations.delete(convKey);
+      await clearOrderDraft(phoneNumberId, userPhone);
+      return finish(`Conversation reset ho gaya hai.\n\n${buildGreetingResponse(config)}`);
+    }
+    if (isGreetingMessage(userMessage)) return finish(buildGreetingResponse(config));
 
-    switch (intent.intent) {
-      case "GREETING":
-        response = buildGreetingResponse(config);
-        break;
-
-      case "MENU":
-        response = menuText + `\n\n💬 Order karne ke liye item name likhein.`;
-        break;
-
-      case "ITEM_CHECK": {
-        const checkItems = intent.items || [];
-        if (checkItems.length === 0) {
-          response = "Kaunsa item check karna hai? Item ka naam likhein.";
-          break;
-        }
-
-        const askedItem = checkItems[0].name;
-        const found = findMenuItem(askedItem, flatMenu);
-
-        if (found) {
-          response =
-            `✅ Haan! *${found}* available hai.\n` +
-            `Price: ${currency} ${flatMenu[found]}\n\n` +
-            `Order karne ke liye "1 ${found}" likhein.`;
-        } else {
-          response =
-            `❌ Maaf kijiye, *${askedItem}* available nahi hai.\n\n` +
-            `Hamare paas yeh items hain:\n\n` +
-            menuText;
-        }
-        break;
+    // State machine: active order draft steers the conversation
+    const draft = await getOrderDraft(phoneNumberId, userPhone);
+    if (draft) {
+      if (isCancelMessage(userMessage)) {
+        await clearOrderDraft(phoneNumberId, userPhone);
+        return finish('Order cancel ho gaya.\n\nAur kuch help chahiye? "menu" likhein.');
       }
-
-      case "PRICE_QUERY": {
-        const priceItems = intent.items || [];
-        if (priceItems.length === 0) {
-          response = "Kaunsa item ka rate puchna hai?";
-          break;
-        }
-
-        const priceMatched: { name: string; price: number }[] = [];
-        const priceNotFound: string[] = [];
-
-        for (const item of priceItems) {
-          const key = findMenuItem(item.name, flatMenu);
-          if (key) {
-            priceMatched.push({ name: key, price: flatMenu[key] });
-          } else {
-            priceNotFound.push(item.name);
-          }
-        }
-
-        if (priceMatched.length > 0) {
-          response = formatPriceInfo(priceMatched, currency);
-          if (priceNotFound.length > 0) {
-            response += `\n\n❌ Yeh items available nahi: ${priceNotFound.join(", ")}`;
-          }
-        } else {
-          response = `❌ Yeh items available nahi.\n\n` + menuText;
-        }
-        break;
-      }
-
-      case "ORDER": {
-        const tz = business.timezone ?? 'Asia/Karachi';
-        if (!isRestaurantOpen(business.hours, tz)) {
-          response = closedMessage(business.name, business.hours);
-          break;
-        }
-
-        const orderItems = intent.items || [];
-        if (orderItems.length === 0) {
-          response = "Kya order karna hai? Item ka naam aur quantity likhein.";
-          break;
-        }
-
-        let ambiguous = false;
-        for (const item of orderItems) {
-          const matches = findAllMatches(item.name, flatMenu);
-          if (matches.length > 1) {
-            const exactMatch = matches.find(
-              (m) => m.toLowerCase() === item.name.toLowerCase()
+      if (draft.phase === "AWAITING_QUANTITY") {
+        const quantity = isQuantity(userMessage);
+        if (quantity !== null) {
+          const item = { ...draft.items[0], qty: quantity, lineTotal: draft.items[0].price * quantity };
+          const updated = makeDraft("AWAITING_ADDRESS", [item], draft.deliveryFee);
+          if (updated.subtotal < config.business.minimumOrder) {
+            return finish(
+              minimumOrderMessage(
+                config.business.minimumOrder - updated.subtotal,
+                config.business.minimumOrder,
+                currency
+              )
             );
-            if (!exactMatch) {
-              ambiguous = true;
-              response =
-                `🤔 "${item.name}" mein kaunsa chahiye?\n\n` +
-                matches
-                  .map((m, i) => `${i + 1}. ${m} - ${currency} ${flatMenu[m]}`)
-                  .join("\n") +
-                `\n\nFull naam likh kar bhejein.`;
-              break;
-            }
           }
+          await saveOrderDraft(phoneNumberId, userPhone, updated);
+          return finish(formatAddressPrompt(config));
         }
-
-        if (!ambiguous) {
-          try {
-            const { subtotal, matched } = calculateOrder(orderItems, flatMenu);
-            const total = subtotal + business.deliveryFee;
-            await savePendingOrder(phoneNumberId, userPhone, matched, subtotal, total);
-            response = formatOrderConfirmation(matched, subtotal, config);
-          } catch (err: unknown) {
-            const errorMsg = err instanceof Error ? err.message : String(err || "");
-            if (errorMsg.startsWith("ITEM_NOT_FOUND:")) {
-              const itemName = errorMsg.replace("ITEM_NOT_FOUND:", "");
-              response =
-                `❌ Maaf kijiye, *${itemName}* available nahi hai.\n\n` +
-                menuText;
-            } else {
-              console.error("Failed to save pending order:", err);
-              response = `⚠️ System error: order save karne mein masla hua. Thori dair baad try karein.`;
-            }
-          }
+      } else if (draft.phase === "AWAITING_ADDRESS") {
+        const looksLikeCommand =
+          isMenuRequest(userMessage) ||
+          isGreetingMessage(userMessage) ||
+          isThanksMessage(userMessage) ||
+          isConfirmMessage(userMessage) ||
+          isDeliveryAreaQuery(userMessage) ||
+          isDeliveryEtaQuery(userMessage) ||
+          parseOrderStatusQuery(userMessage).isStatus;
+        const address = userMessage.trim();
+        if (!looksLikeCommand && address.length >= 4) {
+          const updated: OrderDraft = {
+            ...draft,
+            phase: "AWAITING_CONFIRMATION",
+            address,
+            confirmation: "PENDING",
+            updatedAt: new Date().toISOString(),
+          };
+          await saveOrderDraft(phoneNumberId, userPhone, updated);
+          return finish(formatDraftSummary(updated, currency));
         }
-        break;
-      }
-
-      case "CONFIRM":
-        response =
-          `✅ Shukriya!\n\n` +
-          `Aap ka *delivery address* kya hai?\n\n` +
-          `Hum yahan deliver karte hain:\n` +
-          `${business.deliveryAreas.map((a) => `• ${a}`).join("\n")}\n\n` +
-          `Apna pura address aur phone number bhejein.`;
-        break;
-
-      case "CANCEL":
-        response = `Order cancel ho gaya. ❌\n\nAur kuch help chahiye? "menu" likhein.`;
-        break;
-
-      case "ADDRESS": {
-        let order = null;
-        try {
-          order = await confirmOrder(
-            phoneNumberId,
-            userPhone,
-            userMessage,
-            business.deliveryFee
+        if (!looksLikeCommand) {
+          return finish('Pura delivery address batayein (e.g. "Gulshan Block 5").');
+        }
+      } else if (draft.phase === "AWAITING_CONFIRMATION") {
+        if (isConfirmMessage(userMessage)) {
+          const order = await finalizeOrderDraft(phoneNumberId, userPhone);
+          if (!order)
+            return finish('Order confirm nahi ho saka. Thori dair baad "Yes" likh kar dobara try karein.');
+          return finish(
+            `✅ Order confirm ho gaya.\n\nOrder ID: ${order.id}\n\nEstimated delivery:\n${config.business.deliveryTime}.`
           );
-        } catch (err) {
-          console.error("Failed to confirm order:", err);
-          response = `⚠️ System error: order confirm karne mein masla hua. Thori dair baad try karein.`;
-          break;
         }
-        if (!order) {
-          response =
-            config.responses?.noOrderFound ??
-            `⚠️ Pending order nahi mila.\n\n` +
-              `Pehle apna order dein (e.g. "1 chicken biryani"), phir address bhejein.`;
-          break;
+        if (isCancelMessage(userMessage)) {
+          await clearOrderDraft(phoneNumberId, userPhone);
+          return finish("Order cancel ho gaya.");
         }
-        response =
-          `✅ *Order confirm ho gaya!*\n\n` +
-          `📦 *Order ID: ${order.id}*\n\n` +
-          `📞 Confirmation call: ${business.phone}\n` +
-          `🛵 Delivery time: ${business.deliveryTime}\n\n` +
-          `Shukriya! 🙏`;
-        break;
       }
-
-      case "COMPLAINT":
-        response =
-          `Maaf kijiye, hamare prices fixed hain.\n` +
-          `Discount available nahi hai.\n\n` +
-          `Order karne ke liye menu dekhein:\n\n` +
-          menuText;
-        break;
-
-      case "THANKS":
-        response =
-          `Aap ka shukriya! 🙏\n` +
-          `${business.name} ko visit karne ke liye!`;
-        break;
-
-      default:
-        const norm = normalizeText(userMessage);
-        if (isGreetingMessage(userMessage)) {
-            console.error("BUG: Greeting reached fallback handler", {
-              rawMessage: userMessage,
-              normalizedMessage: norm
-            });
-        }
-        response =
-          `Maaf kijiye, samajh nahi saka. 🤔\n\n` +
-          `Yeh karein:\n\n` +
-          `📋 "menu" - menu dekhne ke liye\n` +
-          `🛒 "1 chicken biryani" - order ke liye\n` +
-          `💬 Item ka naam - rate ke liye`;
     }
 
-    return finish(response);
+    const route = routeDeterministically(userMessage, menu);
+
+    if (route?.kind === "ITEM_NOT_AVAILABLE") {
+      return finish(formatItemNotAvailable(route.itemName, menu));
+    }
+    if (route?.kind === "ambiguous") {
+      return finish(
+        `"${route.itemName}" mein kaunsa chahiye?\n\n${route.matches
+          .map((item, index) => `${index + 1}. ${item} - ${currency} ${menu[item]}`)
+          .join("\n")}\n\nFull naam likh kar bhejein.`
+      );
+    }
+    if (route?.kind === "CHEAPEST_ITEM") {
+      return finish(
+        `Hamare menu mein sab se sasti item *${route.item}* hai (${currency} ${route.price}).\n\nOrder karne ke liye "1 ${route.item}" likhein.`
+      );
+    }
+    if (route?.kind === "BUDGET_QUERY") {
+      if (route.items.length > 0) {
+        return finish(
+          `${currency} ${route.budget} ke budget mein yeh items available hain:\n\n${route.items
+            .map((i) => `• ${i.name} - ${currency} ${i.price}`)
+            .join("\n")}\n\nOrder karne ke liye item ka naam likhein.`
+        );
+      }
+      const cheapest = Object.entries(menu).reduce((a, b) => (b[1] < a[1] ? b : a));
+      return finish(
+        `Maaf kijiye, ${currency} ${route.budget} se kam mein koi item available nahi hai.\n\nHamari sab se sasti item *${cheapest[0]}* (${currency} ${cheapest[1]}) hai.`
+      );
+    }
+    if (route?.kind === "DELIVERY_AREAS") {
+      return finish(
+        `Ji haan! Hum Karachi mein in ilaaqon mein deliver karte hain:\n\n${config.business.deliveryAreas
+          .map((area) => `• ${area}`)
+          .join("\n")}\n\n• Minimum order: ${currency} ${config.business.minimumOrder}\n• Delivery fee: ${currency} ${config.business.deliveryFee}\n• Delivery time: ${config.business.deliveryTime}\n\nOrder karne ke liye item ka naam likhein (e.g. "1 chicken biryani").`
+      );
+    }
+    if (route?.kind === "DELIVERY_ETA") {
+      return finish(`Delivery taqreeban ${config.business.deliveryTime} mein ho jati hai.`);
+    }
+    if (route?.kind === "ORDER_STATUS") {
+      if (draft) {
+        return finish(`Aapka order abhi in-progress hai.\n\n${draftReprompt(draft, config)}`);
+      }
+      if (route.orderId) {
+        const order = await getOrderById(phoneNumberId, route.orderId);
+        if (order) {
+          return finish(
+            `Aapka order #${order.id} record mein maujood hai.\n\nItems:\n${order.items
+              .map((i) => `• ${i.qty}x ${i.name}`)
+              .join("\n")}\n\nTotal: ${currency} ${order.total}\nDelivery address: ${order.address}\nDelivery time: ${config.business.deliveryTime}.`
+          );
+        }
+        return finish(
+          `Order ID "${route.orderId}" hamare system mein nahi mila. Meharbani karke sahi Order ID check karein.`
+        );
+      }
+      const latest = await getLatestOrderForUser(phoneNumberId, userPhone);
+      if (latest) {
+        return finish(
+          `Aapka aakhri order #${latest.id} record mein maujood hai.\n\nItems:\n${latest.items
+            .map((i) => `• ${i.qty}x ${i.name}`)
+            .join("\n")}\n\nTotal: ${currency} ${latest.total}\nDelivery address: ${latest.address}\nDelivery time: ${config.business.deliveryTime}.`
+        );
+      }
+      return finish(`Aapka koi recent order record mein nahi mila. Agar aapke paas Order ID hai to bhejein (e.g. "ORD-XXXX").`);
+    }
+
+    const intent = route?.kind === "intent" ? route.intent : await classifyIntent(userMessage, history, menu);
+    if (!intent || intent.intent === "UNKNOWN") {
+      if (draft) return finish(draftReprompt(draft, config));
+      return finish(
+        `Maaf kijiye, main sirf ${config.business.name} ke menu, prices, delivery aur orders ke baray mein madad kar sakta hoon.\n\n"menu" likhein ya order ke liye item ka naam bhejein.`
+      );
+    }
+
+    if (intent.intent === "MENU") return finish(`${menuText}\n\n💬 Order karne ke liye item name likhein.`);
+    if (intent.intent === "GREETING") return finish(buildGreetingResponse(config));
+    if (intent.intent === "THANKS") return finish(`Aap ka shukriya! 🙏\n${config.business.name} mein dobara aayein!`);
+    if (intent.intent === "COMPLAINT")
+      return finish(`Maaf kijiye, hamare prices fixed hain.\n\nMenu dekhein: "menu" likhein.`);
+    if (intent.intent === "CONFIRM") {
+      if (draft) return finish(draftReprompt(draft, config));
+      return finish('Abhi koi pending order nahi hai.\n\nPehle order dein, e.g. "1 chicken biryani".');
+    }
+    if (intent.intent === "CANCEL") {
+      if (draft) {
+        await clearOrderDraft(phoneNumberId, userPhone);
+        return finish('Order cancel ho gaya.\n\nAur kuch help chahiye? "menu" likhein.');
+      }
+      return finish("Cancel karne ke liye pehle koi active order hona chahiye.");
+    }
+    if (intent.intent === "ITEM_CHECK" || intent.intent === "PRICE_QUERY") {
+      const requested = intent.items[0]?.name;
+      if (!requested) return finish(`Kaunsa item check karna hai? Item ka naam likhein.\n\n${menuText}`);
+      const found = findMenuItem(requested, menu);
+      if (!found) return finish(formatItemNotAvailable(requested, menu));
+      if (intent.intent === "ITEM_CHECK") {
+        return finish(
+          `✅ Haan! *${found}* available hai.\nPrice: ${currency} ${menu[found]}\n\nOrder karne ke liye "1 ${found}" likhein.`
+        );
+      }
+      return finish(`*${found}*: ${currency} ${menu[found]}\n\nOrder karna ho to "1 ${found}" likhein.`);
+    }
+    if (intent.intent === "ORDER") {
+      const orderItems = intent.items;
+      if (!orderItems.length)
+        return finish('Kya order karna hai? Item ka naam likhein, e.g. "1 chicken biryani".');
+      if (!isRestaurantOpen(config.business.hours, config.business.timezone ?? "Asia/Karachi"))
+        return finish(closedMessage(config.business.name, config.business.hours));
+      const resolved = toPersistedItems(orderItems, menu);
+      if (!Array.isArray(resolved)) return finish(formatItemNotAvailable(resolved.itemName, menu));
+      if (resolved.length === 1) {
+        await saveOrderDraft(
+          phoneNumberId,
+          userPhone,
+          makeDraft("AWAITING_QUANTITY", resolved, config.business.deliveryFee)
+        );
+        return finish(promptForQuantity(resolved[0]));
+      }
+      const nextDraft = makeDraft("AWAITING_ADDRESS", resolved, config.business.deliveryFee);
+      if (nextDraft.subtotal < config.business.minimumOrder)
+        return finish(
+          minimumOrderMessage(
+            config.business.minimumOrder - nextDraft.subtotal,
+            config.business.minimumOrder,
+            currency
+          )
+        );
+      await saveOrderDraft(phoneNumberId, userPhone, nextDraft);
+      return finish(formatAddressPrompt(config));
+    }
+
+    if (draft) return finish(draftReprompt(draft, config));
+    if (intent.intent === "ADDRESS")
+      return finish('Pehle apna order dein (e.g. "1 chicken biryani"), phir hum address mangenge.');
+    return finish(
+      `Maaf kijiye, main sirf ${config.business.name} ke menu, prices, delivery aur orders ke baray mein madad kar sakta hoon.\n\n"menu" likhein ya order ke liye item ka naam bhejein.`
+    );
   } catch (error) {
-    console.error("[agent] Response generation failed:", error);
+    console.error("[agent] unexpected_response_failure", {
+      error,
+      stack: error instanceof Error ? error.stack : undefined,
+      phoneNumberId,
+      userPhone,
+      userMessage,
+    });
     return finish("⚠️ Technical issue hai. Thori dair baad try karein.");
   }
 }

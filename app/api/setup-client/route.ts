@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getRedis } from "@/lib/redis";
-import { ClientConfig } from "@/lib/client-config";
+import { ClientConfig, MenuCategory } from "@/lib/client-config";
 
 export const dynamic = "force-dynamic";
 
@@ -15,14 +15,17 @@ export async function POST(request: NextRequest) {
     return err("Unauthorized", 401);
   }
 
-  let body: any;
+  let body: Record<string, unknown>;
   try {
-    body = await request.json();
+    body = (await request.json()) as Record<string, unknown>;
   } catch {
     return err("Invalid JSON body");
   }
 
-  const { phone_number_id, whatsapp_token, business, menu } = body;
+  const phone_number_id = body.phone_number_id;
+  const whatsapp_token = body.whatsapp_token;
+  const business = (body.business ?? null) as Record<string, unknown> | null;
+  const menu = (body.menu ?? null) as MenuCategory[] | null;
 
   if (!phone_number_id || typeof phone_number_id !== "string") {
     return err("phone_number_id is required");
@@ -30,7 +33,7 @@ export async function POST(request: NextRequest) {
   if (!whatsapp_token || typeof whatsapp_token !== "string") {
     return err("whatsapp_token is required");
   }
-  if (!business || typeof business !== "object") {
+  if (!business || typeof business !== "object" || Array.isArray(business)) {
     return err("business config is required");
   }
 
@@ -59,22 +62,22 @@ export async function POST(request: NextRequest) {
   }
 
   const config: ClientConfig = {
-    phoneNumberId: phone_number_id,
-    whatsappToken: whatsapp_token,
+    phoneNumberId: phone_number_id as string,
+    whatsappToken: whatsapp_token as string,
     business: {
-      name: business.name,
-      address: business.address,
-      hours: business.hours,
-      phone: business.phone,
-      deliveryAreas: business.deliveryAreas,
+      name: String(business.name),
+      address: String(business.address),
+      hours: String(business.hours),
+      phone: String(business.phone),
+      deliveryAreas: Array.isArray(business.deliveryAreas) ? (business.deliveryAreas as string[]) : [],
       minimumOrder: Number(business.minimumOrder),
       deliveryFee: Number(business.deliveryFee),
-      deliveryTime: business.deliveryTime,
-      currency: business.currency ?? "Rs.",
-      language: business.language,
+      deliveryTime: String(business.deliveryTime),
+      currency: typeof business.currency === "string" ? business.currency : "Rs.",
+      language: typeof business.language === "string" ? business.language : undefined,
     },
     menu,
-    responses: body.responses ?? undefined,
+    responses: (body.responses as ClientConfig["responses"]) ?? undefined,
   };
 
   try {
